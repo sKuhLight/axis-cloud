@@ -1,8 +1,8 @@
 # Axis Cloud (sync backend)
 
 Optional cloud sync for [Axis](https://github.com/sKuhLight/Axis): backs up your config and presets,
-with version history, across devices. **Open-source + self-hostable** — point Axis at the hosted
-service (a supporter convenience) *or* your own Supabase project.
+with version history, across devices. **Source-available + self-hostable for noncommercial use** —
+point Axis at the hosted service (a supporter convenience) *or* run your own Supabase project.
 
 ## What it is
 A **Supabase project** (Postgres + Auth + Storage) — no custom server. Per-user isolation via
@@ -65,3 +65,12 @@ want email confirmations.
 - [x] ForgeFX sync client (supabase-js, gated by `AXIS_CLOUD`)
 - [x] Axis login + per-scope sync toggles + cloud preset viewer / version restore
 - [ ] Patreon account link → `subscriptions` (hosted supporter tier)
+
+## License
+Copyright © 2026 sKuhLight. Licensed under the **PolyForm Noncommercial License 1.0.0** — see
+[`LICENSE.md`](./LICENSE.md). In short: you may use, modify, and self-host this for **any noncommercial
+purpose** (personal use, research, non-profits), but **not for commercial advantage or monetary
+compensation**. Commercial rights — including the hosted supporter service — are reserved by the author.
+
+> This is *source-available*, not OSI "open source" (an OSI license would have to permit commercial use).
+> "Noncommercial" can be a gray area for edge cases — if you want to use Axis Cloud commercially, ask.
