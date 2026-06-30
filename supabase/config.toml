@@ -1,0 +1,20 @@
+# Supabase CLI config for Axis Cloud. `project_id` is a local identifier; `supabase link --project-ref
+# <ref>` connects this to a hosted project. Regenerate/extend with `supabase init` if your CLI version
+# expects newer keys. No secrets here — those live in the dashboard / .env (gitignored).
+project_id = "axis-cloud"
+
+[db]
+port = 54322
+major_version = 15
+
+[auth]
+# Email/password to start (works headless from ForgeFX). Turn confirmations on once SMTP is configured.
+enable_signup = true
+[auth.email]
+enable_signup = true
+enable_confirmations = true
+
+[storage]
+enabled = true
+# Preset .syx blobs (brotli-compressed by ForgeFX). Raise if you store large full-device backups.
+file_size_limit = "50MiB"
