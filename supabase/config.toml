@@ -18,3 +18,8 @@ enable_confirmations = true
 enabled = true
 # Preset .syx blobs (brotli-compressed by ForgeFX). Raise if you store large full-device backups.
 file_size_limit = "50MiB"
+
+[functions.delete-account]
+# GDPR Art. 17 account erasure. JWT-gated: the caller is identified from their own token,
+# so a user can only delete themselves. Runs with the service role (server-side only).
+verify_jwt = true
