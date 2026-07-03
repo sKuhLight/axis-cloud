@@ -23,3 +23,9 @@ file_size_limit = "50MiB"
 # GDPR Art. 17 account erasure. JWT-gated: the caller is identified from their own token,
 # so a user can only delete themselves. Runs with the service role (server-side only).
 verify_jwt = true
+
+[functions.gc-blobs]
+# Orphan-blob sweep (quota enforcement is metadata-gated; interrupted syncs can leave unreferenced
+# blobs). NOT user-facing: gated by the GC_SECRET header, invoked manually or on a schedule — no
+# user JWT involved.
+verify_jwt = false
