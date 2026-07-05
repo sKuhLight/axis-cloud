@@ -10,6 +10,18 @@ major_version = 15
 [auth]
 # Email/password to start (works headless from ForgeFX). Turn confirmations on once SMTP is configured.
 enable_signup = true
+# Confirmation emails redirect to the Site URL by default; keep it the STABLE public web domain so the
+# link never points at localhost / the desktop app's random port. The app passes an explicit
+# emailRedirectTo (see ForgeFX runtime/cloud.ts) which MUST appear in additional_redirect_urls below, or
+# Supabase silently falls back to site_url. Auth is headless (email/password) so the redirect carries no
+# session — the target is just a friendly "confirmed" landing page.
+# NOTE: this drives the LOCAL stack only. Set the same values on the hosted project under
+# Dashboard → Authentication → URL Configuration (or `supabase config push`).
+site_url = "https://axisapp.live"
+additional_redirect_urls = [
+  "https://axisapp.live/auth/confirmed",
+  "http://localhost:5173/auth/confirmed"  # local dev (set AXIS_AUTH_CONFIRM_URL to match)
+]
 [auth.email]
 enable_signup = true
 enable_confirmations = true
