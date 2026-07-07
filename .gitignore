@@ -12,3 +12,9 @@ supabase/.branches/
 # misc
 .DS_Store
 *.log
+
+# Claude Code local config (private: Plane MCP, personal settings)
+.mcp.json
+CLAUDE.local.md
+.claude/settings.local.json
+CLAUDE.md
