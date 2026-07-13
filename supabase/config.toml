@@ -41,3 +41,9 @@ verify_jwt = true
 # blobs). NOT user-facing: gated by the GC_SECRET header, invoked manually or on a schedule — no
 # user JWT involved.
 verify_jwt = false
+
+[functions.device-profiles]
+# Global device-definition profile store (AXISCLOUD-2). GET is public (profiles are shared, non-user
+# data), so JWT verification is OFF at the platform layer; the function verifies the caller's token
+# MANUALLY on POST (upload) and writes with the service role.
+verify_jwt = false

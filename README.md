@@ -14,6 +14,7 @@ supabase/
   config.toml                 # CLI config (auth/storage); no secrets
   migrations/                 # versioned schema (run in order)
     20260630120000_init.sql   # documents, preset_versions, backups, subscriptions + preset-blobs bucket
+    20260713120000_device_profiles.sql  # global, public-read device-definition profile store
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
 ```
 
@@ -36,6 +37,29 @@ Hosted cloud + early-access features are a **supporter** tier (planned via **Pat
 billing to build or maintain). A Patreon account link sets `subscriptions.plan` for that user; Axis
 reads only its own row. The `source` column keeps it provider-neutral so the backend can switch later.
 Self-hosters skip this entirely — run your own project and everything is unlocked.
+
+## Device-definition profile store (shared, not user data)
+A **global, cross-user** store for derived *device-definition profiles* (`BuiltCache` JSON docs, produced
+by ForgeFX's on-connect self-describe walk / editor-cache parse). A profile is **identical for every
+device of the same model on the same firmware**, so it is shared: the first user on a new firmware
+uploads it, and everyone else downloads it instead of rebuilding. These are **derived tables only**
+(param ranges, model rosters, enum overrides, cab-IR names, section maps) — **never raw Fractal editor
+files and never any preset content.**
+
+- **Table `device_profiles`** (public read via RLS; **no client write policy** — writes are service-role
+  only). Keyed by `(model, firmware, content_hash)` with a size guard; `content_hash` is the sha256 of the
+  canonical profile JSON, computed **server-side** (a client-supplied hash is never trusted).
+- **Edge function `device-profiles`** (JWT verification off at the platform layer so GET is public):
+  - `GET ?model=<int>&firmware=<string>` → newest matching profile + metadata (`404` if none;
+    `Cache-Control: public, max-age=300`).
+  - `POST { model, firmware, source, profile }` → **requires a valid user JWT**. Validates `model`
+    (int 1..255), `firmware` (`^\d+\.\d+`), `source` (`live-walk` | `editor-cache`) and the profile's
+    plausible `BuiltCache` shape, caps the body (~6 MB), computes the hash, and inserts with the service
+    role. An identical existing profile returns `{ deduped: true }`; a user may add at most 10 new
+    profiles per hour.
+- **Key discipline (ForgeFX side):** profiles are keyed `<model-hex>_<major>p<minor>` (e.g. FM3 fw 12.0
+  → `11_12p0`); this backend stores the `model` byte as an integer (`0x11` = 17) and `firmware` as a
+  string (`"12.0"`).
 
 ## Gating (so it never ships dark)
 The entire sync layer is behind `AXIS_CLOUD=1`. With it unset, ForgeFX loads no cloud code and Axis
@@ -64,6 +88,7 @@ want email confirmations.
 - [x] Schema + RLS + Storage policy
 - [x] ForgeFX sync client (supabase-js, gated by `AXIS_CLOUD`)
 - [x] Axis login + per-scope sync toggles + cloud preset viewer / version restore
+- [x] Global device-definition profile store (`device_profiles` + `device-profiles` edge fn)
 - [ ] Patreon account link → `subscriptions` (hosted supporter tier)
 
 ## License
