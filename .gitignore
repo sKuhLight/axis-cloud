@@ -17,7 +17,6 @@ supabase/.branches/
 .mcp.json
 CLAUDE.local.md
 .claude/settings.local.json
-CLAUDE.md
 
 # Claude Code session git worktrees (scripts/stack-worktree.sh)
 .wt-*/
