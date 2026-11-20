@@ -9,8 +9,9 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 //        none). Public. `schema` selects the profile schema (`profile.meta.schema`, the codec's
 //        CACHE_SCHEMA) the caller can use: the newest row of THAT schema is returned, so clients on
 //        different schemas never hide each other's profiles. Without `schema` (clients that predate the
-//        parameter) only unstamped rows and schemas in LEGACY_SCHEMAS (<= 1) are eligible, so such a client is
-//        never handed a profile derived under rules newer than the ones it knows.
+//        parameter) only unstamped rows and schemas in LEGACY_SCHEMAS (<= 1) are eligible. Schema 1 is the
+//        first stamped format; its document shape is the same as the unstamped one, so a pre-schema client
+//        can apply it (it may carry derivation fixes that client lacks, never a changed format).
 //   POST { model, firmware, source, profile }  → validate + hash server-side + insert. Requires a JWT.
 //
 // verify_jwt is OFF for this function (config.toml) so GET stays public; POST verifies the caller's
@@ -18,8 +19,8 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // Reject bodies larger than this before parsing (a BuiltCache is well under a MB; this bounds abuse).
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
-// Profile schemas an old client (one that sends no `schema` parameter) may be served, besides unstamped rows.
-// Those clients shipped before the schema parameter, i.e. with schema 1 at most.
+// Profile schemas an old client (one that sends no `schema` parameter) may be served, besides unstamped rows:
+// schema 1 keeps the unstamped document shape. A later schema that changes the shape must not be added here.
 const LEGACY_SCHEMAS = [0, 1];
 // Upper bound for a requested schema number (rejects junk; real schemas are small integers).
 const MAX_SCHEMA = 1_000_000;
