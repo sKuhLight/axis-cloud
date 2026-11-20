@@ -5,7 +5,12 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 // (ForgeFX deviceCache.ts → forgefx-midi buildCache), identical for every device of the same model on
 // the same firmware — NOT user data. First user on a new firmware uploads; everyone else downloads.
 //
-//   GET  ?model=<int>&firmware=<string>  → newest matching profile + metadata (404 if none). Public.
+//   GET  ?model=<int>&firmware=<string>[&schema=<int>]  → newest matching profile + metadata (404 if
+//        none). Public. `schema` selects the profile schema (`profile.meta.schema`, the codec's
+//        CACHE_SCHEMA) the caller can use: the newest row of THAT schema is returned, so clients on
+//        different schemas never hide each other's profiles. Without `schema` (clients that predate the
+//        parameter) only unstamped rows and schemas in LEGACY_SCHEMAS (<= 1) are eligible, so such a client is
+//        never handed a profile derived under rules newer than the ones it knows.
 //   POST { model, firmware, source, profile }  → validate + hash server-side + insert. Requires a JWT.
 //
 // verify_jwt is OFF for this function (config.toml) so GET stays public; POST verifies the caller's
@@ -13,6 +18,11 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // Reject bodies larger than this before parsing (a BuiltCache is well under a MB; this bounds abuse).
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
+// Profile schemas an old client (one that sends no `schema` parameter) may be served, besides unstamped rows.
+// Those clients shipped before the schema parameter, i.e. with schema 1 at most.
+const LEGACY_SCHEMAS = [0, 1];
+// Upper bound for a requested schema number (rejects junk; real schemas are small integers).
+const MAX_SCHEMA = 1_000_000;
 // Per-user insert budget: at most this many NEW profiles per rolling hour (dedups don't count against it).
 const RATE_LIMIT_PER_HOUR = 10;
 
@@ -85,11 +95,25 @@ Deno.serve(async (req: Request) => {
     if (!Number.isInteger(model) || model < 1 || model > 255 || !firmware) {
       return new Response(JSON.stringify({ error: "bad request: model (1..255) and firmware required" }), { status: 400, headers: json });
     }
-    const { data, error } = await admin
+    // Optional schema filter on the stored profile's meta.schema (jsonb path `profile->meta->>schema`,
+    // compared as text; no migration or index needed — rows per (model, firmware) are few).
+    const schemaRaw = q.get("schema");
+    let schema: number | null = null;
+    if (schemaRaw !== null) {
+      schema = /^\d{1,7}$/.test(schemaRaw) ? Number(schemaRaw) : NaN;
+      if (!Number.isInteger(schema) || schema < 1 || schema > MAX_SCHEMA) {
+        return new Response(JSON.stringify({ error: `bad request: schema must be an integer 1..${MAX_SCHEMA}` }), { status: 400, headers: json });
+      }
+    }
+    let query = admin
       .from("device_profiles")
       .select("id, model, firmware, content_hash, profile, source, record_count, created_at")
       .eq("model", model)
-      .eq("firmware", firmware)
+      .eq("firmware", firmware);
+    query = schema !== null
+      ? query.eq("profile->meta->>schema", String(schema))
+      : query.or(`profile->meta->>schema.is.null,profile->meta->>schema.in.(${LEGACY_SCHEMAS.join(",")})`);
+    const { data, error } = await query
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();

@@ -50,8 +50,12 @@ files and never any preset content.**
   only). Keyed by `(model, firmware, content_hash)` with a size guard; `content_hash` is the sha256 of the
   canonical profile JSON, computed **server-side** (a client-supplied hash is never trusted).
 - **Edge function `device-profiles`** (JWT verification off at the platform layer so GET is public):
-  - `GET ?model=<int>&firmware=<string>` → newest matching profile + metadata (`404` if none;
-    `Cache-Control: public, max-age=300`).
+  - `GET ?model=<int>&firmware=<string>[&schema=<int>]` → newest matching profile + metadata (`404` if
+    none; `Cache-Control: public, max-age=300`). `schema` is the profile schema the caller can use
+    (`profile.meta.schema`): the newest row **of that schema** is returned, so clients on different
+    schemas never hide each other's profiles (`400` unless an integer 1..1000000). Without `schema`
+    (older clients) only unstamped rows and schema <= 1 are served. No migration — the filter reads the
+    stored profile JSON.
   - `POST { model, firmware, source, profile }` → **requires a valid user JWT**. Validates `model`
     (int 1..255), `firmware` (`^\d+\.\d+`), `source` (`live-walk` | `editor-cache`) and the profile's
     plausible `BuiltCache` shape, caps the body (~6 MB), computes the hash, and inserts with the service
