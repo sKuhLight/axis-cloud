@@ -11,12 +11,26 @@ export const MAX_JSON_BODY_BYTES = 8 * 1024;
 /** New captures per user per rolling window (pending reservations count). */
 export const RATE_LIMIT_PER_WINDOW = 5;
 export const RATE_WINDOW_SECONDS = 60 * 60;
-/** Announced bytes per user per rolling quota window. */
+/** Bytes per user per rolling quota window. A reservation whose upload is not confirmed yet counts at the full
+ *  upload cap (MAX_UPLOAD_BYTES), not at the announced size — the announced size is unverified until finalize
+ *  — and finalize then records the real size. */
 export const QUOTA_BYTES = 200 * 1024 * 1024;
 export const QUOTA_WINDOW_SECONDS = 30 * 24 * 60 * 60;
 
 /** Lifetime of a storage signed upload URL/token (fixed by Supabase Storage: 2 hours). */
 export const SIGNED_UPLOAD_TTL_SECONDS = 2 * 60 * 60;
+
+/** A pending reservation older than this is recreated instead of reused/refreshed on a repeat reserve: gc-blobs
+ *  sweeps pending rows after 24 h, and a client must never be handed an upload URL for a row that sweep is
+ *  about to delete. Must stay below gc-blobs' grace window. */
+export const PENDING_REFRESH_MAX_AGE_SECONDS = 20 * 60 * 60;
+
+/** Access tokens are JWTs (three base64url parts). Anything else cannot be valid, so it is rejected without a
+ *  round trip to the Auth server. The length cap is generous (real tokens are ~1-2 KB). */
+const JWT_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+export function looksLikeJwt(token: string): boolean {
+  return token.length <= 8192 && JWT_SHAPE_RE.test(token);
+}
 
 export const BUCKET = "diagnostic-captures";
 /** The bundle id becomes part of a storage object name: keep it path-safe (also a DB CHECK). */

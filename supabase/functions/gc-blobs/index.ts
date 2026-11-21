@@ -98,12 +98,13 @@ async function sweepDiagnostics(admin: Admin, dry: boolean): Promise<Diagnostics
         const { data: gone, error: oerr } = await admin.storage.from(DIAG_BUCKET).remove(batch.map((r) => r.object_path));
         if (oerr) continue;
         res.objectsRemoved += gone?.length ?? 0;
-        const { error: derr } = await admin
+        const { data: deleted, error: derr } = await admin
           .from("diagnostic_captures")
           .delete()
           .in("id", batch.map((r) => r.id))
-          .eq("status", "complete");
-        if (!derr) res.rowsRemoved += batch.length;
+          .eq("status", "complete")
+          .select("id");
+        if (!derr) res.rowsRemoved += deleted?.length ?? 0;
       }
 
       // Pending rows (stale reservations, or an expired one that never completed): ROWS first, and only rows

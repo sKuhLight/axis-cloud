@@ -58,7 +58,9 @@ const deps: Deps = {
       p_max_per_window: a.maxPerWindow,
       p_window_seconds: a.windowSeconds,
       p_quota_bytes: a.quotaBytes,
-      p_quota_window_seconds: a.quotaWindowSeconds
+      p_quota_window_seconds: a.quotaWindowSeconds,
+      p_pending_charge_bytes: a.pendingChargeBytes,
+      p_pending_max_age_seconds: a.pendingMaxAgeSeconds
     });
     if (error) {
       // Custom SQLSTATEs raised by the function: XQ001 = rate limit, XQ002 = byte quota; DETAIL = retry seconds.
@@ -118,7 +120,10 @@ const deps: Deps = {
       if (isNotFound(error as StorageErrorLike)) return null;
       throw error;
     }
-    return { size: Number(data.size) };
+    // A missing/garbled size must not be read as "0 bytes" or "no object": fail loudly (-> 500, logged).
+    const size = Number(data.size);
+    if (!Number.isFinite(size) || size < 0) throw new Error("storage returned no usable object size");
+    return { size };
   },
 
   async readHead(path, n) {
@@ -147,6 +152,11 @@ const deps: Deps = {
     }
     await reader.cancel().catch(() => {});
     return head.subarray(0, got);
+  },
+
+  async removeObject(path) {
+    const { error } = await admin.storage.from(BUCKET).remove([path]);
+    if (error) throw error;
   },
 
   async completeCapture(userId, rowId, bytes) {

@@ -17,6 +17,7 @@ supabase/
     20260713120000_device_profiles.sql  # global, public-read device-definition profile store
     20261121120000_diagnostic_captures.sql  # opt-in diagnostic uploads: maintainer-only table + private bucket
     20261121130000_diagnostic_captures_signed_upload.sql  # status, atomic reserve function (limits, quota), bucket re-assert
+    20261121140000_diagnostic_reserve_pending_charge.sql  # reserve: pending charged at the cap, refresh/recreate of pending rows
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
 ```
 
@@ -93,12 +94,14 @@ policy** (and its privileges are revoked from `anon`/`authenticated`); the bucke
 storage policy**. Only the **service role** (the maintainer, plus the edge functions) can read or write.
 
 **Upload flow** — the edge function `diagnostic-captures` only handles small JSON requests; the bundle goes
-**directly from the client to storage** via a signed upload URL (the function never receives or parses it, and
-hosted edge functions could not take a 25 MiB body anyway). All requests carry `Authorization: Bearer <user
-access token>`. `verify_jwt` is **off** for this function on purpose: the handler authenticates the caller itself
-before reading anything, so every authentication failure has the same body, `{ "error": "unauthorized" }` (with
-the platform check on, a bad token would get the platform's own differently shaped 401), and verification does
-not depend on the project's JWT-signing mode. Anonymous sessions are refused (`403 account-required`).
+**directly from the client to storage** via a signed upload URL (the function never receives or parses it, so
+nothing here depends on a hosted edge function accepting a body of that size). All requests carry
+`Authorization: Bearer <user access token>`. `verify_jwt` is **off** for this function on purpose: the handler
+authenticates the caller itself before reading anything, so every authentication failure has the same body,
+`{ "error": "unauthorized" }` (with the platform check on, a bad token would get the platform's own differently
+shaped 401), and verification does not depend on the project's JWT-signing mode. A token that is not
+JWT-shaped is refused the same way without a round trip to the Auth server. Anonymous sessions are refused
+(`403 account-required`).
 
 1. **Reserve** — `POST /functions/v1/diagnostic-captures` with
    `{ captureId, model, firmware, app?, state?, bytes }`: `captureId` is the bundle's own id
@@ -109,9 +112,13 @@ not depend on the project's JWT-signing mode. Anonymous sessions are refused (`4
    cannot race past the limits) and returns
    `200 { captureId, status: 'pending', uploadUrl, token, path, bucket, expiresIn }`. Its `captureId` is the
    **row id** (a UUID) — keep it for finalize. A repeat of a known bundle id is deduped (`deduped: true`, no new
-   slot or quota): `status: 'complete'` means nothing is left to do; `status: 'pending'` with a new upload URL
-   means upload again; `status: 'pending'` **without** `uploadUrl` means the object is already there — go
-   straight to finalize.
+   slot): `status: 'complete'` means nothing is left to do; `status: 'pending'` with a new upload URL means
+   upload again; `status: 'pending'` **without** `uploadUrl` means the object is already there — go straight to
+   finalize. While no object has been uploaded yet, a repeat also **refreshes the announced `bytes`** (quota
+   re-checked), so a retry with a re-gzipped bundle of a different size can still finalize. A pending
+   reservation older than ~20 h is **recreated** instead (new row id, new `created_at`; rate limit and quota
+   apply as for any new reservation), so you are never handed an upload URL for a row the 24 h sweep is about
+   to delete — always use the `captureId` of the latest reserve response.
 2. **Upload** — send the gzip to storage with the returned credentials, either
    `PUT <uploadUrl>` with `Content-Type: application/gzip` (and the project's `apikey` header, as supabase-js sends
    it), or — preferred, because it builds the URL from your own configured base URL —
@@ -124,7 +131,9 @@ not depend on the project's JWT-signing mode. Anonymous sessions are refused (`4
    exists, that its size is ≤ the announced `bytes` (and ≤ 25 MiB), and — with a 2-byte range read — that it
    starts with the gzip magic bytes; it then sets `status = 'complete'` and the actual size and answers
    `200 { captureId, status: 'complete' }` (idempotent). No full download, decompression or JSON parsing happens
-   anywhere server-side.
+   anywhere server-side. An object that fails these checks (too large, larger than announced, not gzip) is
+   **deleted immediately**; the row stays pending, so the client can reserve again (same `captureId` of the
+   bundle), upload a corrected file and finalize.
 
 | Status | Body `error` | When |
 |---|---|---|
@@ -132,9 +141,9 @@ not depend on the project's JWT-signing mode. Anonymous sessions are refused (`4
 | 401 | `unauthorized` | missing, invalid or expired token |
 | 403 | `account-required` | anonymous session |
 | 404 | `not-found` | finalize: no such row for this user (or it was swept) |
-| 409 | `not-uploaded`, `size-mismatch` | finalize: no object yet / object larger than announced |
+| 409 | `not-uploaded`, `size-mismatch` | finalize: no object yet / object larger than announced (the object is deleted) |
 | 413 | `too-large` | `bytes` above 25 MiB, a request body above 8 KiB, or a stored object above 25 MiB |
-| 429 | `rate-limited`, `quota-exceeded` | **5** new captures per user per rolling hour (pending reservations count), or more than **200 MiB** announced in a rolling 30 days. Body has `retryAfterSeconds`; the `Retry-After` header is set and CORS-exposed |
+| 429 | `rate-limited`, `quota-exceeded` | **5** new captures per user per rolling hour (pending reservations count), or more than **200 MiB** in a rolling 30 days. Until finalize confirms the upload, a reservation counts at the full **25 MiB** cap rather than at the announced `bytes` (an unverified claim), so at most 8 unconfirmed reservations can be outstanding; finalize then records the real size and frees the difference. Body has `retryAfterSeconds`; the `Retry-After` header is set and CORS-exposed |
 | 500 | `internal` | storage/database failure (details only in the function log) |
 
 **Retention:** `expires_at` defaults to `created_at + 180 days`. The `gc-blobs` function (see below for the

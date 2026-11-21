@@ -22,6 +22,11 @@ const USER = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
 const ANON = "33333333-3333-4333-8333-333333333333";
 const T0 = Date.parse("2026-11-21T12:00:00Z");
+// The handler refuses anything that is not JWT-shaped before calling authenticate.
+const TOKEN = "hdr.payload.good";
+const TOKEN_OTHER = "hdr.payload.other";
+const TOKEN_ANON = "hdr.payload.anon";
+const TOKEN_UNKNOWN = "hdr.payload.unknown";
 
 // ── fakes ──
 
@@ -45,26 +50,49 @@ function makeDeps() {
   const rows: Row[] = [];
   const objects = new Map<string, Uint8Array>();
   const reserveCalls: ReserveArgs[] = [];
-  const state = { now: T0, seq: 0 };
+  const removed: string[] = [];
+  const state = { now: T0, seq: 0, authCalls: 0 };
 
   const deps: Deps = {
     authenticate: (t) =>
       Promise.resolve(
-        t === "good" ? { id: USER, isAnonymous: false } : t === "other" ? { id: OTHER, isAnonymous: false } : t === "anon" ? { id: ANON, isAnonymous: true } : null
+        (state.authCalls++,
+        t === TOKEN ? { id: USER, isAnonymous: false } : t === TOKEN_OTHER ? { id: OTHER, isAnonymous: false } : t === TOKEN_ANON ? { id: ANON, isAnonymous: true } : null)
       ),
 
-    // Mimics reserve_diagnostic_capture: dedup, then rate limit, then byte quota, then insert.
+    // Mimics reserve_diagnostic_capture (the SQL is what is authoritative — see the pgTAP file):
+    //  dedup (complete -> as is; pending older than pendingMaxAge -> recreate; pending with an object -> as is;
+    //  pending without one -> refresh `bytes`), then rate limit (new rows only), then byte quota where a
+    //  pending row counts at pendingChargeBytes, then insert.
     reserve: (a): Promise<ReserveResult> => {
       reserveCalls.push(a);
       const existing = rows.find((r) => r.userId === a.userId && r.captureId === a.captureId);
-      if (existing) return Promise.resolve({ kind: "ok", id: existing.id, status: existing.status, deduped: true });
-      const inWindow = rows.filter((r) => r.userId === a.userId && r.createdAt > state.now - a.windowSeconds * 1000).sort((x, y) => y.createdAt - x.createdAt);
-      if (inWindow.length >= a.maxPerWindow) {
-        const oldest = inWindow[a.maxPerWindow - 1].createdAt;
-        return Promise.resolve({ kind: "limited", reason: "rate", retryAfterSeconds: Math.ceil((oldest + a.windowSeconds * 1000 - state.now) / 1000) });
+      let refresh: Row | null = null;
+      if (existing) {
+        if (existing.status === "complete") return Promise.resolve({ kind: "ok", id: existing.id, status: "complete", deduped: true });
+        if (state.now - existing.createdAt > a.pendingMaxAgeSeconds * 1000) {
+          rows.splice(rows.indexOf(existing), 1); // too old: recreate below
+        } else if (objects.has(existing.objectPath)) {
+          return Promise.resolve({ kind: "ok", id: existing.id, status: "pending", deduped: true });
+        } else {
+          refresh = existing;
+        }
       }
-      const used = rows.filter((r) => r.userId === a.userId && r.createdAt > state.now - a.quotaWindowSeconds * 1000).reduce((s, r) => s + r.bytes, 0);
+      if (!refresh) {
+        const inWindow = rows.filter((r) => r.userId === a.userId && r.createdAt > state.now - a.windowSeconds * 1000).sort((x, y) => y.createdAt - x.createdAt);
+        if (inWindow.length >= a.maxPerWindow) {
+          const oldest = inWindow[a.maxPerWindow - 1].createdAt;
+          return Promise.resolve({ kind: "limited", reason: "rate", retryAfterSeconds: Math.ceil((oldest + a.windowSeconds * 1000 - state.now) / 1000) });
+        }
+      }
+      const used = rows
+        .filter((r) => r.userId === a.userId && r.createdAt > state.now - a.quotaWindowSeconds * 1000 && r !== refresh)
+        .reduce((sum, r) => sum + (r.status === "pending" ? a.pendingChargeBytes : r.bytes), 0);
       if (used + a.bytes > a.quotaBytes) return Promise.resolve({ kind: "limited", reason: "quota", retryAfterSeconds: 4242 });
+      if (refresh) {
+        refresh.bytes = a.bytes;
+        return Promise.resolve({ kind: "ok", id: refresh.id, status: "pending", deduped: true });
+      }
       const id = `00000000-0000-4000-8000-${String(++state.seq).padStart(12, "0")}`;
       rows.push({
         id,
@@ -97,9 +125,14 @@ function makeDeps() {
       r.status = "complete";
       r.bytes = bytes;
       return Promise.resolve(true);
+    },
+    removeObject: (p) => {
+      objects.delete(p);
+      removed.push(p);
+      return Promise.resolve();
     }
   };
-  return { deps, rows, objects, reserveCalls, state };
+  return { deps, rows, objects, reserveCalls, removed, state };
 }
 
 // ── request helpers ──
@@ -107,7 +140,7 @@ function makeDeps() {
 function post(suffix: string, body: unknown, headers: Record<string, string> = {}): Request {
   return new Request(`http://localhost/diagnostic-captures${suffix}`, {
     method: "POST",
-    headers: { authorization: "Bearer good", "content-type": "application/json", ...headers },
+    headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", ...headers },
     body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body)
   });
 }
@@ -170,7 +203,7 @@ Deno.test("only POST is allowed", async () => {
 
 Deno.test("401 without a valid bearer token on both endpoints; nothing is reserved", async () => {
   const { deps, rows, reserveCalls } = makeDeps();
-  for (const authorization of ["", "Bearer nope", "Basic abc"]) {
+  for (const authorization of ["", `Bearer ${TOKEN_UNKNOWN}`, "Basic abc"]) {
     for (const suffix of ["", "/finalize"]) {
       const res = await handleRequest(post(suffix, reserveBody(), { authorization }), deps);
       assertEquals(res.status, 401);
@@ -183,10 +216,10 @@ Deno.test("401 without a valid bearer token on both endpoints; nothing is reserv
 
 Deno.test("an anonymous session is refused (403) on both endpoints", async () => {
   const { deps, rows, reserveCalls } = makeDeps();
-  const res = await reserve(deps, {}, { authorization: "Bearer anon" });
+  const res = await reserve(deps, {}, { authorization: `Bearer ${TOKEN_ANON}` });
   assertEquals(res.status, 403);
   assertEquals((await bodyOf(res)).error, "account-required");
-  assertEquals((await finalize(deps, "00000000-0000-4000-8000-000000000001", { authorization: "Bearer anon" })).status, 403);
+  assertEquals((await finalize(deps, "00000000-0000-4000-8000-000000000001", { authorization: `Bearer ${TOKEN_ANON}` })).status, 403);
   assertEquals(rows.length, 0);
   assertEquals(reserveCalls.length, 0);
 });
@@ -230,7 +263,9 @@ Deno.test("reserve: pending row + signed upload for <user>/<capture>.json.gz", a
     maxPerWindow: 5,
     windowSeconds: 3600,
     quotaBytes: 200 * 1024 * 1024,
-    quotaWindowSeconds: 30 * 24 * 3600
+    quotaWindowSeconds: 30 * 24 * 3600,
+    pendingChargeBytes: 25 * 1024 * 1024,
+    pendingMaxAgeSeconds: 20 * 3600
   });
 });
 
@@ -281,7 +316,7 @@ Deno.test("requests over the JSON body cap get 413 (declared length and streamed
   const { deps, reserveCalls } = makeDeps();
   // Declared Content-Length: replace the Request's guarded headers with a plain Headers object.
   const declared = post("", reserveBody());
-  Object.defineProperty(declared, "headers", { value: new Headers({ authorization: "Bearer good", "content-length": "999999" }) });
+  Object.defineProperty(declared, "headers", { value: new Headers({ authorization: `Bearer ${TOKEN}`, "content-length": "999999" }) });
   assertEquals(declared.headers.get("content-length"), "999999"); // the override took effect
   const res = await handleRequest(declared, deps);
   assertEquals(res.status, 413);
@@ -339,7 +374,7 @@ Deno.test("reserve: rate limit maps to 429 with retryAfterSeconds + Retry-After;
   assertEquals(limited.headers.get("retry-after"), String(55 * 60));
   assertEquals(rows.length, 5);
   // Another user is not affected; a repeat of a known capture is never throttled.
-  assertEquals((await reserve(deps, { captureId: "cap-5" }, { authorization: "Bearer other" })).status, 200);
+  assertEquals((await reserve(deps, { captureId: "cap-5" }, { authorization: `Bearer ${TOKEN_OTHER}` })).status, 200);
   assertEquals((await reserve(deps, { captureId: "cap-4" })).status, 200);
   // After the oldest ages out, the slot frees up.
   state.now = T0 + 60 * 60_000 + 1000;
@@ -348,7 +383,8 @@ Deno.test("reserve: rate limit maps to 429 with retryAfterSeconds + Retry-After;
 
 Deno.test("reserve: byte quota maps to 429 quota-exceeded", async () => {
   const { deps, rows } = makeDeps();
-  const cfg: HandlerConfig = { ...DEFAULT_CONFIG, quotaBytes: 2500 };
+  // maxUploadBytes 1000 => each unconfirmed reservation is charged 1000 against the 2500 quota
+  const cfg: HandlerConfig = { ...DEFAULT_CONFIG, maxUploadBytes: 1000, quotaBytes: 2500 };
   assertEquals((await reserve(deps, { captureId: "a", bytes: 1000 }, {}, cfg)).status, 200);
   assertEquals((await reserve(deps, { captureId: "b", bytes: 1000 }, {}, cfg)).status, 200);
   const res = await reserve(deps, { captureId: "c", bytes: 1000 }, {}, cfg);
@@ -392,7 +428,7 @@ Deno.test("finalize: 404 for an unknown row and for another user's row", async (
   const h = makeDeps();
   const rowId = await reserveAndUpload(h, "cap-0001", 1000);
   assertEquals((await finalize(h.deps, ROW_UNKNOWN)).status, 404);
-  assertEquals((await finalize(h.deps, rowId, { authorization: "Bearer other" })).status, 404);
+  assertEquals((await finalize(h.deps, rowId, { authorization: `Bearer ${TOKEN_OTHER}` })).status, 404);
   assertEquals(h.rows[0].status, "pending");
 });
 
@@ -417,14 +453,15 @@ Deno.test("finalize: success flips the row to complete with the ACTUAL size; ide
   assertEquals(h.rows[0].bytes, 900);
 });
 
-Deno.test("finalize: an object larger than announced is refused (size-mismatch) and left in place", async () => {
+Deno.test("finalize: an object larger than announced is refused (size-mismatch) and DELETED; the row stays pending", async () => {
   const h = makeDeps();
   const rowId = await reserveAndUpload(h, "cap-0001", 5000, 1000);
   const res = await finalize(h.deps, rowId);
   assertEquals(res.status, 409);
   assertEquals(await bodyOf(res), { error: "size-mismatch", announced: 1000, actual: 5000 });
   assertEquals(h.rows[0].status, "pending");
-  assert(h.objects.has(objectPath(USER, "cap-0001"))); // gc-blobs removes it with the pending row
+  assertEquals(h.removed, [objectPath(USER, "cap-0001")]);
+  assertEquals(h.objects.size, 0); // a bad object does not linger until the 24 h sweep
 });
 
 Deno.test("finalize: an object above the hard limit is refused (413)", async () => {
@@ -435,6 +472,7 @@ Deno.test("finalize: an object above the hard limit is refused (413)", async () 
   const res = await finalize(h.deps, out.captureId, {}, "/finalize", cfg);
   assertEquals(res.status, 413);
   assertEquals(await bodyOf(res), { error: "too-large", stage: "stored", limit: 2000 });
+  assertEquals(h.objects.size, 0);
 });
 
 Deno.test("finalize: a stored object that is not gzip is refused (400)", async () => {
@@ -447,6 +485,7 @@ Deno.test("finalize: a stored object that is not gzip is refused (400)", async (
     assertEquals(res.status, 400);
     assertEquals((await bodyOf(res)).error, "invalid-gzip");
     assertEquals(h.rows[0].status, "pending");
+    assertEquals(h.objects.size, 0); // deleted, not left for gc-blobs
   }
 });
 
@@ -493,6 +532,102 @@ Deno.test("end to end: reserve -> upload -> finalize -> repeat reserve", async (
   assertEquals((await finalize(h.deps, res.captureId)).status, 200);
   assertEquals(await bodyOf(await reserve(h.deps)), { captureId: res.captureId, deduped: true, status: "complete" });
   assertEquals(h.rows.length, 1);
+});
+
+// ── S-A / N-a / N-c / N-f ──
+
+Deno.test("malformed bearer tokens are refused (401) without calling the Auth server", async () => {
+  const h = makeDeps();
+  const tooLong = `${"a".repeat(8000)}.${"b".repeat(200)}.sig`;
+  for (const authorization of ["Bearer nope", "Bearer a.b", "Bearer a.b.c.d", "Bearer a b.c.d", "Bearer a..c", `Bearer ${tooLong}`, "Bearer "]) {
+    for (const suffix of ["", "/finalize"]) {
+      const res = await handleRequest(post(suffix, reserveBody(), { authorization }), h.deps);
+      assertEquals(res.status, 401, authorization.slice(0, 30));
+      assertEquals(await bodyOf(res), { error: "unauthorized" });
+    }
+  }
+  assertEquals(h.state.authCalls, 0);
+  // A well-formed token does reach authenticate.
+  assertEquals((await reserve(h.deps)).status, 200);
+  assertEquals(h.state.authCalls, 1);
+});
+
+Deno.test("S-A: unconfirmed reservations are charged at the upload cap, not at the announced bytes", async () => {
+  const h = makeDeps();
+  // cap 1000 (maxUploadBytes), quota 2500: each pending row costs 1000 however little it announces.
+  const cfg: HandlerConfig = { ...DEFAULT_CONFIG, maxUploadBytes: 1000, quotaBytes: 2500 };
+  for (const id of ["a", "b", "c"]) assertEquals((await reserve(h.deps, { captureId: id, bytes: 2 }, {}, cfg)).status, 200);
+  assertEquals(h.reserveCalls[0].pendingChargeBytes, 1000); // the handler passes the cap as the charge
+  // Announced bytes sum to 6, yet a fourth reservation is refused: three pending rows count 3000 > 2500.
+  const res = await reserve(h.deps, { captureId: "d", bytes: 2 }, {}, cfg);
+  assertEquals(res.status, 429);
+  assertEquals((await bodyOf(res)).error, "quota-exceeded");
+  // Finalizing a small upload records its real size and frees the rest of that charge.
+  h.objects.set(objectPath(USER, "a"), gz(2));
+  assertEquals((await finalize(h.deps, h.rows[0].id, {}, "/finalize", cfg)).status, 200);
+  assertEquals(h.rows[0].bytes, 2);
+  assertEquals((await reserve(h.deps, { captureId: "d", bytes: 2 }, {}, cfg)).status, 200);
+});
+
+Deno.test("N-a: after a rejected upload a repeat reserve refreshes the announced size and finalize then succeeds", async () => {
+  const h = makeDeps();
+  const rowId = await reserveAndUpload(h, "cap-0001", 5000, 1000); // client announced 1000 but uploaded 5000
+  assertEquals((await finalize(h.deps, rowId)).status, 409); // size-mismatch, object deleted
+  // The client re-gzipped to 5000 bytes: same capture id, new announced size.
+  const again = await reserve(h.deps, { bytes: 5000 });
+  assertEquals(again.status, 200);
+  const out = await bodyOf(again);
+  assertEquals(out.captureId, rowId); // same row, deduped
+  assertEquals(out.deduped, true);
+  assert(typeof out.uploadUrl === "string"); // a fresh signed URL (the bad object is gone)
+  assertEquals(h.rows[0].bytes, 5000);
+  h.objects.set(objectPath(USER, "cap-0001"), gz(5000));
+  assertEquals((await finalize(h.deps, rowId)).status, 200);
+  assertEquals(h.rows.length, 1);
+});
+
+Deno.test("N-a: a repeat reserve does not refresh the size once the object is there", async () => {
+  const h = makeDeps();
+  await reserveAndUpload(h, "cap-0001", 1000);
+  const res = await reserve(h.deps, { bytes: 3000 });
+  assertEquals((await bodyOf(res)).uploadUrl, undefined); // finalize instead
+  assertEquals(h.rows[0].bytes, 1000);
+});
+
+Deno.test("N-a: refreshing the announced size is quota-checked", async () => {
+  const h = makeDeps();
+  const cfg: HandlerConfig = { ...DEFAULT_CONFIG, maxUploadBytes: 1000, quotaBytes: 1500 };
+  assertEquals((await reserve(h.deps, { bytes: 1 }, {}, cfg)).status, 200);
+  const res = await reserve(h.deps, { bytes: 1000 }, {}, cfg); // the row itself is excluded: 0 + 1000 <= 1500
+  assertEquals(res.status, 200);
+  const big = await reserve(h.deps, { bytes: 1600 }, {}, { ...cfg, maxUploadBytes: 2000 }); // 0 + 1600 > 1500
+  assertEquals(big.status, 429);
+  assertEquals(h.rows[0].bytes, 1000); // unchanged by the refused refresh
+});
+
+Deno.test("N-c: the handler passes the 20 h limit; a pending row older than that is recreated, not reused", async () => {
+  const h = makeDeps();
+  const first = await bodyOf(await reserve(h.deps));
+  assertEquals(h.reserveCalls[0].pendingMaxAgeSeconds, 20 * 3600);
+  h.state.now = T0 + 19 * 3600_000; // still fresh: reused
+  const reused = await bodyOf(await reserve(h.deps));
+  assertEquals(reused.captureId, first.captureId);
+  assertEquals(reused.deduped, true);
+  h.state.now = T0 + 21 * 3600_000; // older than 20 h: recreated with a new id (no `deduped`)
+  const recreated = await bodyOf(await reserve(h.deps));
+  assert(recreated.captureId !== first.captureId);
+  assertEquals(recreated.deduped, undefined);
+  assertEquals(h.rows.length, 1);
+  assertEquals(h.rows[0].createdAt, h.state.now);
+});
+
+Deno.test("a failure removing a rejected object does not change the finalize answer", async () => {
+  const h = makeDeps();
+  const rowId = await reserveAndUpload(h, "cap-0001", 5000, 1000);
+  h.deps.removeObject = () => Promise.reject(new Error("storage down"));
+  const res = await quiet(() => finalize(h.deps, rowId));
+  assertEquals(res.status, 409);
+  assertEquals((await bodyOf(res)).error, "size-mismatch");
 });
 
 // ── validate.ts ──

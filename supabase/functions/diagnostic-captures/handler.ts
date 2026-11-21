@@ -1,8 +1,9 @@
 // Request handling for `diagnostic-captures` (signed-upload flow), with every side effect behind `Deps` so
 // the whole flow is testable with in-memory fakes (handler.test.ts). index.ts wires the Supabase adapter.
 //
-// The function never receives, decompresses or parses the gzip bundle (it can be up to 25 MiB; that is
-// neither safe nor possible inside an edge worker). It only handles small JSON requests:
+// The function never receives, decompresses or parses the gzip bundle (it can be up to 25 MiB; reading and
+// parsing client-supplied compressed data in an edge worker is a memory-exhaustion risk, and this design
+// does not rely on a hosted function accepting a body that large). It only handles small JSON requests:
 //
 //  1. POST  /diagnostic-captures            reserve
 //       { captureId, model, firmware, app?, state?, bytes }   captureId = the bundle's own id (path-safe),
@@ -15,6 +16,8 @@
 //     200 { captureId, deduped: true, status: 'complete' }  already uploaded and confirmed: nothing to do
 //     200 { captureId, deduped: true, status: 'pending' }   reserved and the object is already there (an
 //           earlier attempt uploaded but did not finalize): skip the upload, call finalize
+//     A repeat of a pending bundle id whose object is NOT there refreshes the announced `bytes` (so a
+//     re-gzipped retry can finalize); a pending row older than ~20 h is recreated instead (new row id).
 //  2. POST  /diagnostic-captures/finalize   (or ?action=finalize)
 //       { captureId }   the row id from step 1
 //     200 { captureId, status: 'complete' }  (idempotent)
@@ -30,9 +33,11 @@ import {
   isGzip,
   MAX_JSON_BODY_BYTES,
   MAX_UPLOAD_BYTES,
+  looksLikeJwt,
   objectPath,
   parseFinalizeRequest,
   parseReserveRequest,
+  PENDING_REFRESH_MAX_AGE_SECONDS,
   QUOTA_BYTES,
   QUOTA_WINDOW_SECONDS,
   RATE_LIMIT_PER_WINDOW,
@@ -53,6 +58,10 @@ export interface ReserveArgs {
   windowSeconds: number;
   quotaBytes: number;
   quotaWindowSeconds: number;
+  /** What an unconfirmed (pending) reservation counts against the quota: the full upload cap. */
+  pendingChargeBytes: number;
+  /** Pending rows older than this are recreated rather than reused (avoids racing gc-blobs' 24 h sweep). */
+  pendingMaxAgeSeconds: number;
 }
 
 export type ReserveResult =
@@ -84,6 +93,8 @@ export interface Deps {
   readHead(path: string, n: number): Promise<Uint8Array | null>;
   /** pending -> complete with the actual size; false if the row was not pending any more. */
   completeCapture(userId: string, rowId: string, bytes: number): Promise<boolean>;
+  /** Delete the stored object (no error if it is already gone). */
+  removeObject(path: string): Promise<void>;
 }
 
 export interface HandlerConfig {
@@ -93,6 +104,7 @@ export interface HandlerConfig {
   rateWindowSeconds: number;
   quotaBytes: number;
   quotaWindowSeconds: number;
+  pendingMaxAgeSeconds: number;
 }
 
 export const DEFAULT_CONFIG: HandlerConfig = {
@@ -101,7 +113,8 @@ export const DEFAULT_CONFIG: HandlerConfig = {
   rateLimitPerWindow: RATE_LIMIT_PER_WINDOW,
   rateWindowSeconds: RATE_WINDOW_SECONDS,
   quotaBytes: QUOTA_BYTES,
-  quotaWindowSeconds: QUOTA_WINDOW_SECONDS
+  quotaWindowSeconds: QUOTA_WINDOW_SECONDS,
+  pendingMaxAgeSeconds: PENDING_REFRESH_MAX_AGE_SECONDS
 };
 
 const cors: Record<string, string> = {
@@ -128,7 +141,8 @@ type User = { id: string };
 /** Authenticates BEFORE any body is read. Anonymous sessions are real JWTs but not accounts. */
 async function authorize(req: Request, deps: Deps): Promise<{ user: User } | { res: Response }> {
   const token = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "")?.[1];
-  if (!token) return { res: fail(401, "unauthorized") };
+  // A malformed token cannot be valid: refuse it without an Auth-server round trip.
+  if (!token || !looksLikeJwt(token)) return { res: fail(401, "unauthorized") };
   const user = await deps.authenticate(token);
   if (!user) return { res: fail(401, "unauthorized") };
   if (user.isAnonymous) {
@@ -195,7 +209,10 @@ async function reserveCapture(user: User, rawBody: unknown, deps: Deps, cfg: Han
     maxPerWindow: cfg.rateLimitPerWindow,
     windowSeconds: cfg.rateWindowSeconds,
     quotaBytes: cfg.quotaBytes,
-    quotaWindowSeconds: cfg.quotaWindowSeconds
+    quotaWindowSeconds: cfg.quotaWindowSeconds,
+    // The announced size is unverified until finalize, so an unconfirmed reservation is charged at the cap.
+    pendingChargeBytes: cfg.maxUploadBytes,
+    pendingMaxAgeSeconds: cfg.pendingMaxAgeSeconds
   });
   if (reserved.kind === "limited") {
     const retryAfterSeconds = Math.max(1, Math.ceil(reserved.retryAfterSeconds));
@@ -235,16 +252,25 @@ async function finalizeCapture(user: User, rawBody: unknown, deps: Deps, cfg: Ha
   if (row.status === "complete") return reply(200, { captureId: row.id, status: "complete" });
 
   // Checks on the stored object — metadata and 2 bytes only; the bundle is never downloaded or parsed here.
+  // A rejected object is DELETED right away (not left for the 24 h sweep): the row stays pending, so the client
+  // can fix its upload — a repeat reserve finds no object and hands out a fresh signed URL.
+  const reject = async (res: Response): Promise<Response> => {
+    try {
+      await deps.removeObject(row.objectPath);
+    } catch (e) {
+      console.error("diagnostic-captures: removing a rejected object failed (gc-blobs will sweep it):", e instanceof Error ? e.message : e);
+    }
+    return res;
+  };
   const stat = await deps.statObject(row.objectPath);
   if (!stat) return fail(409, "not-uploaded", { message: "no object has been uploaded for this capture yet" });
-  if (stat.size > cfg.maxUploadBytes) return fail(413, "too-large", { stage: "stored", limit: cfg.maxUploadBytes });
-  // The quota was reserved for the announced size: an object larger than announced is refused (smaller is fine
-  // and frees the difference). The object is left in place; gc-blobs removes it with the pending row.
-  if (stat.size > row.bytes) return fail(409, "size-mismatch", { announced: row.bytes, actual: stat.size });
-  if (stat.size < 2) return fail(400, "invalid-gzip", { message: "stored object is not a gzip file" });
+  if (stat.size > cfg.maxUploadBytes) return await reject(fail(413, "too-large", { stage: "stored", limit: cfg.maxUploadBytes }));
+  // An object larger than announced is refused (smaller is fine; the real size is recorded below).
+  if (stat.size > row.bytes) return await reject(fail(409, "size-mismatch", { announced: row.bytes, actual: stat.size }));
+  if (stat.size < 2) return await reject(fail(400, "invalid-gzip", { message: "stored object is not a gzip file" }));
   const head = await deps.readHead(row.objectPath, 2);
   if (!head) return fail(409, "not-uploaded", { message: "no object has been uploaded for this capture yet" });
-  if (!isGzip(head)) return fail(400, "invalid-gzip", { message: "stored object is not a gzip file" });
+  if (!isGzip(head)) return await reject(fail(400, "invalid-gzip", { message: "stored object is not a gzip file" }));
 
   const done = await deps.completeCapture(user.id, row.id, stat.size);
   if (!done) {
