@@ -15,6 +15,7 @@ supabase/
   migrations/                 # versioned schema (run in order)
     20260630120000_init.sql   # documents, preset_versions, backups, subscriptions + preset-blobs bucket
     20260713120000_device_profiles.sql  # global, public-read device-definition profile store
+    20261121120000_diagnostic_captures.sql  # opt-in diagnostic uploads: maintainer-only table + private bucket
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
 ```
 
@@ -65,6 +66,88 @@ files and never any preset content.**
   → `11_12p0`); this backend stores the `model` byte as an integer (`0x11` = 17) and `firmware` as a
   string (`"12.0"`).
 
+## Diagnostic captures (opt-in, maintainer-only)
+A signed-in user can upload the result of Axis's in-product **device diagnostic** (Settings → Debugging) so
+the maintainer can analyse how a given model/firmware behaves. It is never sent automatically: the user
+reviews what is uploaded and ticks an explicit consent first.
+
+**What is stored**
+- **Object** — the original gzip of the capture bundle (`schema: 1` JSON) in the **private**
+  `diagnostic-captures` bucket at `<user_id>/<capture_id>.json.gz`: device model, firmware, transport;
+  app/codec versions; per-step results; the wire log (timestamped hex frames) and job logs.
+  Redaction happens **on the user's machine, before upload** (ForgeFX): preset/scene names are blanked,
+  preset dump payloads are reduced to their header, and no file paths, host names or account emails are
+  included. The server validates shape and size only — it cannot re-check redaction, so it stores what it
+  is given.
+- **Row** in `diagnostic_captures` — `user_id`, the bundle's own `capture_id`, `model`, `firmware`, version
+  stamps (`app`: forgefx/codec/axis), `state`, `bytes`, `object_path`, `created_at`, `expires_at`.
+
+**Who can read it:** nobody through the API — not even the uploader. The table has RLS enabled with **no
+policy** (and its privileges are revoked from `anon`/`authenticated`); the bucket is private with **no
+storage policy**. Only the **service role** (the maintainer, plus the edge functions) can read or write.
+
+**Upload API** — Edge function `diagnostic-captures` (`verify_jwt = true`; the user is also resolved from
+the token). `POST` only; body = gzip of the bundle JSON with `Content-Type: application/gzip` (do **not** set
+`Content-Encoding: gzip` — the function must see the original bytes).
+
+| Result | When |
+|---|---|
+| `200 { captureId }` | stored; `captureId` is the `diagnostic_captures.id`. Re-uploading the same bundle id from the same user is idempotent: `200` with the existing id (+ `deduped: true`) and no second copy |
+| `400 { error, message }` | `empty-body`, `invalid-gzip`, `invalid-json`, or `invalid-bundle` (needs `schema === 1`; `id` matching `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`; `device.model` integer 0..255; `device.firmware` string ≤ 64 chars or null; `steps` array of objects) |
+| `401 { error: 'unauthorized' }` | missing/invalid/expired token |
+| `413 { error: 'too-large', stage, limit }` | > **25 MiB** compressed (checked on `Content-Length` and while streaming, before the body is buffered), or > **64 MiB** once decompressed (gzip-bomb guard; sized for the 256 MB edge-worker memory) |
+| `429 { error: 'rate-limited', … }` + `Retry-After` | already **5** new captures in the last rolling hour |
+| `500 { error: 'internal' }` | storage/database failure (details only in the function log) |
+
+**Retention:** `expires_at` defaults to `created_at + 180 days`. The `gc-blobs` function removes expired rows
+together with their objects, and also objects that no row references any more (a crashed upload, or leftovers
+after account deletion) once they are older than 24 h; its JSON result reports this under `diagnostics`.
+**Schedule it** — `gc-blobs` is not self-scheduling; run it **once a day**. With `pg_cron` + `pg_net`
+(Dashboard → Database → Extensions) and the `GC_SECRET` kept in Vault, run once in the SQL editor
+(placeholders only — never commit real values):
+
+```sql
+select vault.create_secret('<GC_SECRET>', 'gc_secret');
+select cron.schedule('gc-blobs-daily', '17 3 * * *', $$
+  select net.http_post(
+    url := 'https://<project-ref>.supabase.co/functions/v1/gc-blobs',
+    headers := jsonb_build_object('x-gc-secret',
+      (select decrypted_secret from vault.decrypted_secrets where name = 'gc_secret'))
+  );
+$$);
+```
+
+Preview what would be removed first with `POST …/functions/v1/gc-blobs?dry=1` (same header).
+
+**Deletion:** the `delete-account` function removes the user's capture objects and rows (the auth-user delete
+also cascades the rows). There is no self-service per-capture delete (users cannot read their captures);
+deleting a single capture on request is a service-role operation (below).
+
+**Reading captures (maintainer, service role).** Keep the key in your environment or secret store — never in
+the repo:
+
+```bash
+export SUPABASE_URL=https://<project-ref>.supabase.co
+export SERVICE_ROLE_KEY=...   # Dashboard → Settings → API; server-side only
+
+# list, newest first (filter e.g. &model=eq.17&firmware=eq.12.0)
+curl -s "$SUPABASE_URL/rest/v1/diagnostic_captures?select=id,user_id,capture_id,model,firmware,state,bytes,created_at,expires_at&order=created_at.desc&limit=50" \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+
+# download one (path = object_path of the row)
+curl -s -o capture.json.gz "$SUPABASE_URL/storage/v1/object/authenticated/diagnostic-captures/<user_id>/<capture_id>.json.gz" \
+  -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+gunzip -k capture.json.gz
+
+# delete one on request: remove the object, then the row
+curl -s -X DELETE "$SUPABASE_URL/storage/v1/object/diagnostic-captures/<user_id>/<capture_id>.json.gz" \
+  -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+curl -s -X DELETE "$SUPABASE_URL/rest/v1/diagnostic_captures?id=eq.<row-id>" \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+```
+
+**Tests:** `deno test supabase/functions/diagnostic-captures/` (in-memory fakes; no Supabase stack needed).
+
 ## Gating (so it never ships dark)
 The entire sync layer is behind `AXIS_CLOUD=1`. With it unset, ForgeFX loads no cloud code and Axis
 shows no login — release builds do not set it.
@@ -93,6 +176,7 @@ want email confirmations.
 - [x] ForgeFX sync client (supabase-js, gated by `AXIS_CLOUD`)
 - [x] Axis login + per-scope sync toggles + cloud preset viewer / version restore
 - [x] Global device-definition profile store (`device_profiles` + `device-profiles` edge fn)
+- [x] Opt-in diagnostic capture upload (`diagnostic_captures` + private bucket + `diagnostic-captures` edge fn)
 - [ ] Patreon account link → `subscriptions` (hosted supporter tier)
 
 ## License
