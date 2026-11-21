@@ -47,3 +47,12 @@ verify_jwt = false
 # data), so JWT verification is OFF at the platform layer; the function verifies the caller's token
 # MANUALLY on POST (upload) and writes with the service role.
 verify_jwt = false
+
+[functions.diagnostic-captures]
+# Opt-in diagnostic capture upload (MT; signed-upload flow: reserve + finalize, small JSON requests only).
+# JWT verification is OFF at the platform layer on purpose: the handler authenticates the caller itself
+# (Auth server getUser, anonymous sessions refused) BEFORE it reads anything, so every auth failure has the
+# same `{ "error": "unauthorized" }` body — the platform check answers with its own, differently shaped
+# body — and token verification does not depend on the project's JWT-signing mode. Writes use the service
+# role.
+verify_jwt = false
