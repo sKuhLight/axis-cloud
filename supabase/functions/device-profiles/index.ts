@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { corsHeaders } from "../_shared/cors.ts";
 
 // Global device-definition profile store (AXISCLOUD-2). Profiles are derived `BuiltCache` docs
 // (ForgeFX deviceCache.ts → forgefx-midi buildCache), identical for every device of the same model on
@@ -27,11 +28,8 @@ const MAX_SCHEMA = 1_000_000;
 // Per-user insert budget: at most this many NEW profiles per rolling hour (dedups don't count against it).
 const RATE_LIMIT_PER_HOUR = 10;
 
-const cors: Record<string, string> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, content-type",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
-};
+// Browser clients (supabase-js, or fetch with its headers) also send `apikey` / `x-client-info`: see _shared/cors.ts.
+const cors = corsHeaders("GET, POST, OPTIONS");
 const json = { ...cors, "Content-Type": "application/json" };
 
 /** sha256 hex of a string (server-computed — a client-supplied hash is never trusted). */
