@@ -47,3 +47,9 @@ verify_jwt = false
 # data), so JWT verification is OFF at the platform layer; the function verifies the caller's token
 # MANUALLY on POST (upload) and writes with the service role.
 verify_jwt = false
+
+[functions.diagnostic-captures]
+# Opt-in diagnostic capture upload (MT). POST-only and signed-in users only, so the platform verifies the
+# JWT up front (unauthenticated callers never reach the function or make it read a body); the function
+# ALSO resolves the user from the token itself, like delete-account. Writes with the service role.
+verify_jwt = true
