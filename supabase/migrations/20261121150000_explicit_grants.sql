@@ -15,17 +15,35 @@
 --     but NOT table privileges.
 --
 -- WHAT: grant exactly what the RLS policies and the real flows use, and nothing more. RLS stays the
--- gate for users; these grants only make the policies reachable. All statements are plain, idempotent
--- GRANTs. On projects created before the default change the same privileges already exist (through the
--- old implicit defaults), so this migration is a no-op there.
+-- gate for users; these grants only make the policies reachable. Every statement is idempotent. All of
+-- them are plain GRANTs except ONE deliberate REVOKE (device_profiles, next paragraph). For the GRANTs,
+-- projects created before the default change already hold the same privileges through the old implicit
+-- defaults, so they change nothing there.
+--
+-- THE ONE REVOKE (device_profiles): the shared profile store is public-read, but its `created_by` column
+-- is the uploader's auth user id. Readable through the Data API, those ids would let anyone enumerate
+-- uploaders, and combined with is_paid(uuid) (below) reveal who is a supporter. So anon/authenticated
+-- get SELECT on every column EXCEPT created_by: the table-level SELECT is revoked from both roles and a
+-- column-level SELECT on (id, model, firmware, content_hash, profile, source, record_count, created_at)
+-- is granted instead. What changes where:
+--   * new projects: the REVOKE is a no-op (they never had table-level SELECT); the column grant is new.
+--   * older projects: the REVOKE REMOVES the table-level SELECT the implicit defaults gave anon and
+--     authenticated (and with it `select *` and created_by), then the column grant restores the rest.
+--     No client uses that read: ForgeFX gets profiles from the device-profiles edge function with the
+--     service role, which keeps its table-level SELECT.
+-- Data API readers must now name their columns (PostgREST `select=id,model,...`); `select=*` (or `*`
+-- in SQL) is rejected with 42501. Re-running this migration is safe: revoking the table-level privilege
+-- also drops column grants, and the following GRANT puts them back.
 --
 -- OUT OF SCOPE (follow-ups, deliberately not done here):
---   * Older projects keep their broader implicit grants (all privileges for anon/authenticated/
---     service_role on every public table, EXECUTE on the helper functions). Tightening them needs
---     REVOKEs, which this migration does not issue; do it as a separate, reviewed migration.
+--   * Apart from device_profiles above, older projects keep their broader implicit grants (all
+--     privileges for anon/authenticated/service_role on every public table, EXECUTE on the helper
+--     functions). Tightening them needs more REVOKEs, which this migration does not issue; do it as a
+--     separate, reviewed migration.
 --   * The new-project default ACL still hands the non-DML privileges (TRUNCATE, REFERENCES, TRIGGER, ...)
---     on new public tables to the three roles. PostgREST cannot issue TRUNCATE, so this is not reachable through the Data API, but a
---     follow-up could revoke it (and `alter default privileges` so future tables start from zero).
+--     on new public tables to the three roles. PostgREST cannot issue TRUNCATE, so this is not reachable
+--     through the Data API, but a follow-up could revoke it (and `alter default privileges` so future
+--     tables start from zero).
 --
 -- NOT granted on purpose:
 --   * diagnostic_captures: nothing for anon/authenticated (its migration revokes them deliberately; the
@@ -33,6 +51,7 @@
 --   * enforce_preset_quota(): nobody. It is trigger-only; EXECUTE is checked at CREATE TRIGGER time, not
 --     when the trigger fires, so no role needs it (see 20260703130000_harden_quota_functions.sql).
 --   * reserve_diagnostic_capture(...): stays service_role only, granted by its own migration.
+--   * device_profiles.created_by: not readable by anon/authenticated (uploader ids stay private).
 --   * TRUNCATE for anyone; anything for `public`.
 
 -- ───────────────────────────── authenticated (signed-in users, RLS-scoped) ─────────────────────────────
@@ -46,26 +65,35 @@ grant select, insert, update, delete on public.documents, public.preset_versions
 
 -- Read-only for clients. subscriptions: the client reads its own row (cloud.ts #subscription(); written only
 -- by the service role). tier_limits: read by the invoker-rights preset_quota() below (policy "tier limits
--- are public", authenticated only). device_profiles: policy "device profiles are public" (select only; the
--- shared store is written exclusively by the device-profiles edge function).
-grant select on public.subscriptions, public.tier_limits, public.device_profiles to authenticated;
+-- are public", authenticated only). (device_profiles is also readable, but column-level only: see the
+-- anon section below, which covers both client roles.)
+grant select on public.subscriptions, public.tier_limits to authenticated;
 
 -- Quota helpers. preset_quota() is `security invoker` (cloud.ts calls rpc('preset_quota')), so it runs as
 -- the caller and needs EXECUTE on itself and on is_paid(), which it calls. is_paid() is security definer
 -- and reads the service-role-written subscriptions row. NB: is_paid(uuid) takes an arbitrary uid, so a
 -- signed-in user who knows another user's uuid can probe that user's paid state; unchanged from older
--- projects and not widened here.
+-- projects and not widened here. What keeps this harmless is that no Data API role can learn other users'
+-- uuids: device_profiles.created_by (uploader ids) is withheld from anon/authenticated below.
 grant execute on function public.is_paid(uuid) to authenticated, service_role;
 grant execute on function public.preset_quota() to authenticated, service_role;
 
--- ──────────────────────────────────── anon (publishable key, signed out) ────────────────────────────────────
+-- ──────────────────────── anon (publishable key, signed out) + device_profiles for both client roles ────────────────────────
 
 -- The only table anonymous callers may read: the shared, non-sensitive device-profile store (policy
--- "device profiles are public", `to anon, authenticated`). The ForgeFX client goes through the
--- device-profiles edge function (service role) rather than PostgREST, so this only matters for direct
--- Data API readers. Everything else is per-user and unusable without auth.uid(); anon gets nothing there.
--- (The anonymous `debug-reports` upload is a Storage policy on storage.objects, not a table grant.)
-grant select on public.device_profiles to anon;
+-- "device profiles are public", `to anon, authenticated`; authenticated reads it the same way). The
+-- ForgeFX client goes through the device-profiles edge function (service role) rather than PostgREST, so
+-- this only matters for direct Data API readers. Everything else is per-user and unusable without
+-- auth.uid(); anon gets nothing there. (The anonymous `debug-reports` upload is a Storage policy on
+-- storage.objects, not a table grant.)
+--
+-- Column-level on purpose: created_by (the uploader's auth user id) is NOT readable by anon/authenticated
+-- (see "THE ONE REVOKE" in the header). Keep the order: a table-level SELECT (old implicit defaults) would
+-- still cover created_by, and revoking at table level also drops any column grants, so the column GRANT
+-- must come after the REVOKE.
+revoke select on public.device_profiles from anon, authenticated;
+grant select (id, model, firmware, content_hash, profile, source, record_count, created_at)
+  on public.device_profiles to anon, authenticated;
 
 -- ───────────────────── service_role (edge functions + maintainer; bypasses RLS, not privileges) ─────────────────────
 

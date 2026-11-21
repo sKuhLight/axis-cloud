@@ -3,9 +3,11 @@
 -- use, so the schema works on Supabase projects created with the secure defaults (no implicit grants).
 --
 -- Positive checks (a needed privilege exists) hold on every stack. Negative checks are limited to what is
--- denied on EVERY stack: the diagnostic_captures revoke, the hardened quota functions, and RLS-gated
--- writes that fail with 42501 whether the privilege is missing (new default) or RLS rejects the row
--- (older, broader implicit grants).
+-- denied on EVERY stack once all migrations are applied: the diagnostic_captures revoke, the hardened quota
+-- functions, nothing for PUBLIC, device_profiles.created_by (the migration revokes the table-level SELECT
+-- from anon/authenticated and grants only the other columns, so uploader ids are unreadable on old and new
+-- stacks alike), and RLS-gated writes that fail with 42501 whether the privilege is missing (new default)
+-- or RLS rejects the row (older, broader implicit grants).
 --
 -- Run against a LOCAL stack only (it needs the migrations applied and creates throw-away rows inside a
 -- transaction that is rolled back):
@@ -15,7 +17,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 
-select plan(77);
+select plan(87);
 
 insert into auth.users (id, email) values
   ('11111111-1111-4111-8111-111111111111', 'grants-a@example.test');
@@ -34,7 +36,7 @@ select is(has_function_privilege('anon', 'public.preset_quota()', 'execute'), fa
 select is(has_function_privilege('anon', 'public.enforce_preset_quota()', 'execute'), false, 'anon cannot execute the trigger-only enforce_preset_quota');
 select is(has_function_privilege('authenticated', 'public.enforce_preset_quota()', 'execute'), false, 'authenticated cannot execute the trigger-only enforce_preset_quota');
 
--- ── tables: the granted privileges (34) ──
+-- ── tables: the granted privileges (32; device_profiles for anon/authenticated is column-level, below) ──
 select ok(
   has_table_privilege(g.grantee::name, 'public.' || g.tbl, g.priv),
   g.grantee || ' has ' || upper(g.priv) || ' on ' || g.tbl)
@@ -52,12 +54,9 @@ from (values
   ('authenticated', 'backups',           'insert'),
   ('authenticated', 'backups',           'update'),
   ('authenticated', 'backups',           'delete'),
-  -- ... and read-only tables
+  -- ... and read-only tables (anon/authenticated read device_profiles per column only: see below)
   ('authenticated', 'subscriptions',     'select'),
   ('authenticated', 'tier_limits',       'select'),
-  ('authenticated', 'device_profiles',   'select'),
-  -- anon: only the public device-profile store
-  ('anon',          'device_profiles',   'select'),
   -- service_role: what delete-account, gc-blobs, device-profiles, diagnostic-captures and the maintainer use
   ('service_role',  'documents',         'select'),
   ('service_role',  'documents',         'delete'),
@@ -89,7 +88,28 @@ select is(
     where has_table_privilege('authenticated', 'public.diagnostic_captures', p)),
   null::text[], 'authenticated has no privilege on diagnostic_captures');
 
--- ── authenticated: the sync flows work through RLS (16) ──
+-- ── device_profiles: public columns readable by anon/authenticated, created_by (uploader ids) not (4) ──
+-- Column-level on purpose: the uploader's user id must not be readable through the Data API (with
+-- is_paid(uuid) it would reveal who is a supporter). has_column_privilege is also true for a table-level
+-- grant, so the created_by checks fail if SELECT is ever granted on the whole table again.
+select is(
+  (select bool_and(has_column_privilege('anon', 'public.device_profiles', c, 'select'))
+     from unnest(array['id', 'model', 'firmware', 'content_hash', 'profile', 'source', 'record_count', 'created_at']) as c),
+  true, 'anon can select every public device_profiles column');
+select is(has_column_privilege('anon', 'public.device_profiles', 'created_by', 'select'), false, 'anon cannot select device_profiles.created_by');
+select is(
+  (select bool_and(has_column_privilege('authenticated', 'public.device_profiles', c, 'select'))
+     from unnest(array['id', 'model', 'firmware', 'content_hash', 'profile', 'source', 'record_count', 'created_at']) as c),
+  true, 'authenticated can select every public device_profiles column');
+select is(has_column_privilege('authenticated', 'public.device_profiles', 'created_by', 'select'), false, 'authenticated cannot select device_profiles.created_by');
+
+-- ── nothing for PUBLIC (4) ──
+select is(has_table_privilege('public', 'public.documents', 'select'), false, 'PUBLIC has no SELECT on documents');
+select is(has_function_privilege('public', 'public.is_paid(uuid)', 'execute'), false, 'PUBLIC cannot execute is_paid');
+select is(has_function_privilege('public', 'public.preset_quota()', 'execute'), false, 'PUBLIC cannot execute preset_quota');
+select is(has_function_privilege('public', 'public.enforce_preset_quota()', 'execute'), false, 'PUBLIC cannot execute enforce_preset_quota');
+
+-- ── authenticated: the sync flows work through RLS (19) ──
 set local role authenticated;
 set local request.jwt.claims = '{"sub":"11111111-1111-4111-8111-111111111111","role":"authenticated"}';
 set local request.jwt.claim.sub = '11111111-1111-4111-8111-111111111111';
@@ -99,12 +119,23 @@ select lives_ok(
     values ('11111111-1111-4111-8111-111111111111', 'config', 'k', '{}'::jsonb, 1)$$,
   'authenticated can insert its own document');
 select is((select count(*)::integer from public.documents), 1, 'authenticated reads its own document');
+-- the real sync write (cloud.ts supabase-js .upsert(..., { onConflict: 'user_id,collection,id' })): PostgREST sends
+-- insert ... on conflict (...) do update set <every column> = excluded.<column>, i.e. it needs INSERT, UPDATE and SELECT
+select lives_ok(
+  $$insert into public.documents (user_id, collection, id, data, updated_at, rev, deleted)
+    values ('11111111-1111-4111-8111-111111111111', 'config', 'k', '{"v":2}'::jsonb, 5, 1, false)
+    on conflict (user_id, collection, id) do update
+      set user_id = excluded.user_id, collection = excluded.collection, id = excluded.id, data = excluded.data,
+          updated_at = excluded.updated_at, rev = excluded.rev, deleted = excluded.deleted$$,
+  'authenticated can upsert its own document (insert ... on conflict do update)');
+select is((select updated_at from public.documents where id = 'k'), 5::bigint, 'the upsert updated the existing row');
 select lives_ok($$update public.documents set rev = 2 where id = 'k'$$, 'authenticated can update its own document');
 select is((select rev from public.documents where id = 'k'), 2, 'the update took effect');
 select lives_ok($$delete from public.documents where id = 'k'$$, 'authenticated can delete its own document');
 select is((select count(*)::integer from public.documents), 0, 'the document is gone');
 
--- the BEFORE INSERT trigger enforce_preset_quota fires as security definer: no EXECUTE grant is needed
+-- the BEFORE INSERT trigger enforce_preset_quota fires although the caller has no EXECUTE on it: EXECUTE on a
+-- trigger function is checked when the trigger is created, not when it fires (so no grant is needed)
 select lives_ok(
   $$insert into public.preset_versions (user_id, id, location, crc, name, model, captured_at, source, bytes, stored, blob_path)
     values ('11111111-1111-4111-8111-111111111111', 'v1', 0, 1, 'n', 'FM3', 1, 'manual', 10, 10, '11111111-1111-4111-8111-111111111111/blobs/x.br')$$,
@@ -118,7 +149,12 @@ select lives_ok(
 
 select lives_ok('select * from public.subscriptions', 'authenticated can read subscriptions (own row only, via RLS)');
 select is((select count(*)::integer from public.tier_limits where tier = 'free'), 1, 'authenticated can read tier_limits');
-select is((select count(*)::integer from public.device_profiles where content_hash = 'grants-test-1'), 1, 'authenticated can read device_profiles');
+select is(
+  (select count(*)::integer from (
+     select id, model, firmware, content_hash, profile, source, record_count, created_at
+       from public.device_profiles where content_hash = 'grants-test-1') s),
+  1, 'authenticated can read the public device_profiles columns');
+select throws_ok('select created_by from public.device_profiles', '42501', null, 'authenticated cannot read device_profiles.created_by');
 
 select throws_ok(
   $$insert into public.subscriptions (user_id, active) values ('11111111-1111-4111-8111-111111111111', true)$$,
@@ -132,11 +168,16 @@ select throws_ok(
   '42501', null, 'authenticated cannot write device_profiles');
 reset role;
 
--- ── anon: public device-profile read only (2) ──
+-- ── anon: public device-profile read only, without created_by (3) ──
 set local role anon;
 set local request.jwt.claims = '{"role":"anon"}';
 set local request.jwt.claim.sub = '';
-select is((select count(*)::integer from public.device_profiles where content_hash = 'grants-test-1'), 1, 'anon can read the public device_profiles');
+select is(
+  (select count(*)::integer from (
+     select id, model, firmware, content_hash, profile, source, record_count, created_at
+       from public.device_profiles where content_hash = 'grants-test-1') s),
+  1, 'anon can read the public device_profiles columns');
+select throws_ok('select created_by from public.device_profiles', '42501', null, 'anon cannot read device_profiles.created_by');
 select throws_ok(
   $$insert into public.device_profiles (model, firmware, content_hash, profile, source)
     values (17, '12.0', 'grants-test-y', '{}'::jsonb, 'live-walk')$$,
