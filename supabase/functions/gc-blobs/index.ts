@@ -8,9 +8,10 @@ import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 // younger than 24 h so it never races an in-flight sync that uploads blob-before-metadata.
 //
 // It also enforces the retention of diagnostic captures (MT): rows past `expires_at` are deleted together
-// with their object in the private `diagnostic-captures` bucket, and objects no row references any more
-// (a crashed upload, or leftovers after account deletion cascaded the rows away) are removed after the same
-// grace window. The result is reported under `diagnostics`.
+// with their object in the private `diagnostic-captures` bucket; reservations whose upload was never
+// confirmed (`status = 'pending'`) are removed after the same 24 h grace; and objects no row references any
+// more (a crashed upload, or leftovers after account deletion cascaded the rows away) are removed after that
+// grace too. The result is reported under `diagnostics`.
 //
 // NOT user-facing: gated by a shared secret header (GC_SECRET env), meant for manual invocation or
 // a schedule (pg_cron / dashboard scheduled trigger; recommended: once a day). Pass ?dry=1 to report
@@ -18,13 +19,14 @@ import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 const GRACE_MS = 24 * 60 * 60 * 1000;
 
 const DIAG_BUCKET = "diagnostic-captures";
-// Bounds one run (expired rows are removed oldest-first; the remainder is picked up by the next run).
-const DIAG_MAX_EXPIRED_PER_RUN = 5000;
+// Bounds one run per category (rows are removed oldest-first; the remainder is picked up by the next run).
+const DIAG_MAX_PER_RUN = 5000;
 
 type Admin = SupabaseClient;
 
 interface DiagnosticsSweep {
   expiredRows: number;
+  stalePendingRows: number;
   objectsRemoved: number;
   rowsRemoved: number;
   orphanObjects: number;
@@ -44,42 +46,92 @@ async function listEntries(admin: Admin, bucket: string, prefix: string) {
   return out;
 }
 
+interface DiagRow {
+  id: string;
+  object_path: string;
+  status: string;
+}
+
+/** Rows that are due for removal, oldest first, bounded: `expired` = past expires_at; `pending` = reserved
+ *  but never confirmed and older than the grace window. */
+async function dueRows(admin: Admin, kind: "expired" | "pending", nowIso: string, pendingCutoffIso: string): Promise<DiagRow[]> {
+  const out: DiagRow[] = [];
+  for (let from = 0; out.length < DIAG_MAX_PER_RUN; from += 1000) {
+    const base = admin.from("diagnostic_captures").select("id, object_path, status");
+    const { data, error } = await (kind === "expired"
+      ? base.lt("expires_at", nowIso).order("expires_at")
+      : base.eq("status", "pending").lt("created_at", pendingCutoffIso).order("created_at")
+    ).order("id").range(from, from + 999);
+    if (error) throw error;
+    out.push(...(data ?? []).map((r) => ({ id: r.id as string, object_path: r.object_path as string, status: r.status as string })));
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+
 /** Retention for diagnostic captures. Never throws: a failure is reported in `error` so the (independent)
  *  preset-blob sweep still runs. */
 async function sweepDiagnostics(admin: Admin, dry: boolean): Promise<DiagnosticsSweep> {
-  const res: DiagnosticsSweep = { expiredRows: 0, objectsRemoved: 0, rowsRemoved: 0, orphanObjects: 0, orphanObjectsRemoved: 0 };
+  const res: DiagnosticsSweep = {
+    expiredRows: 0,
+    stalePendingRows: 0,
+    objectsRemoved: 0,
+    rowsRemoved: 0,
+    orphanObjects: 0,
+    orphanObjectsRemoved: 0
+  };
   try {
-    // A. Expired rows (oldest first, bounded per run).
+    // A. Rows due for removal.
     const nowIso = new Date().toISOString();
-    const expired: { id: string; object_path: string }[] = [];
-    for (let from = 0; expired.length < DIAG_MAX_EXPIRED_PER_RUN; from += 1000) {
-      const { data, error } = await admin
-        .from("diagnostic_captures")
-        .select("id, object_path")
-        .lt("expires_at", nowIso)
-        .order("expires_at")
-        .order("id")
-        .range(from, from + 999);
-      if (error) throw error;
-      expired.push(...(data ?? []).map((r) => ({ id: r.id as string, object_path: r.object_path as string })));
-      if (!data || data.length < 1000) break;
-    }
+    const pendingCutoffIso = new Date(Date.now() - GRACE_MS).toISOString();
+    const expired = await dueRows(admin, "expired", nowIso, pendingCutoffIso);
+    const stale = await dueRows(admin, "pending", nowIso, pendingCutoffIso);
     res.expiredRows = expired.length;
+    res.stalePendingRows = stale.length;
+
     if (!dry) {
-      for (let i = 0; i < expired.length; i += 100) {
-        const batch = expired.slice(i, i + 100);
-        // Objects first: if removal fails the rows stay and the next run retries (a missing object is not
-        // an error), so a row is never deleted while its object lives on.
+      // Complete rows (expired): objects FIRST, then rows — if object removal fails the rows stay and the next
+      // run retries (a missing object is not an error), so a row is never deleted while its object lives on.
+      const complete = expired.filter((r) => r.status === "complete");
+      for (let i = 0; i < complete.length; i += 100) {
+        const batch = complete.slice(i, i + 100);
         const { data: gone, error: oerr } = await admin.storage.from(DIAG_BUCKET).remove(batch.map((r) => r.object_path));
         if (oerr) continue;
         res.objectsRemoved += gone?.length ?? 0;
-        const { error: derr } = await admin.from("diagnostic_captures").delete().in("id", batch.map((r) => r.id));
+        const { error: derr } = await admin
+          .from("diagnostic_captures")
+          .delete()
+          .in("id", batch.map((r) => r.id))
+          .eq("status", "complete");
         if (!derr) res.rowsRemoved += batch.length;
+      }
+
+      // Pending rows (stale reservations, or an expired one that never completed): ROWS first, and only rows
+      // that are STILL pending — a client may have finalized one since it was selected, and then its object
+      // must not be touched. The objects of the rows actually deleted are removed afterwards; if that fails
+      // they become orphans, which step B (same grace) cleans up.
+      const pendingRows = [...new Map([...stale, ...expired.filter((r) => r.status === "pending")].map((r) => [r.id, r])).values()];
+      for (let i = 0; i < pendingRows.length; i += 100) {
+        const batch = pendingRows.slice(i, i + 100);
+        const { data: deleted, error: derr } = await admin
+          .from("diagnostic_captures")
+          .delete()
+          .in("id", batch.map((r) => r.id))
+          .eq("status", "pending")
+          .lt("created_at", pendingCutoffIso)
+          .select("id, object_path");
+        if (derr) continue;
+        res.rowsRemoved += deleted?.length ?? 0;
+        const paths = (deleted ?? []).map((r) => r.object_path as string);
+        if (!paths.length) continue;
+        const { data: gone, error: oerr } = await admin.storage.from(DIAG_BUCKET).remove(paths);
+        if (!oerr) res.objectsRemoved += gone?.length ?? 0;
       }
     }
 
-    // B. Orphan objects: in the bucket but referenced by no row. Loaded AFTER step A so objects it just
-    //    removed are not listed; the grace window protects an upload between its object and its row.
+    // B. Orphan objects: in the bucket but referenced by no row (of ANY status — a pending row's object is
+    //    referenced). Loaded AFTER step A so objects it just removed are not listed; the grace window protects
+    //    an upload between its reservation and its confirmation.
     const referenced = new Set<string>();
     for (let from = 0; ; from += 1000) {
       const { data, error } = await admin.from("diagnostic_captures").select("object_path").order("id").range(from, from + 999);

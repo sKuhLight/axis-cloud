@@ -8,18 +8,26 @@ import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 type Admin = SupabaseClient;
 
 // Removes every object under `<prefix>/` in a bucket, paging until it is empty. Best-effort like the rest of
-// this function (a failure just stops the loop); for the diagnostic-captures bucket the gc-blobs sweep
-// removes any object left behind once its owner's rows are gone.
+// this function: a failure is LOGGED and stops the loop (the account deletion still proceeds). For the
+// diagnostic-captures bucket the gc-blobs sweep then removes the leftovers: once their rows are gone they are
+// unreferenced, and it deletes unreferenced objects older than 24 h on its next scheduled run.
 async function removeAllUnder(admin: Admin, bucket: string, prefix: string): Promise<void> {
   for (let round = 0; round < 100; round++) {
     const { data: files, error } = await admin.storage.from(bucket).list(prefix, { limit: 1000 });
-    if (error || !files) return;
+    if (error) {
+      console.error(`delete-account: listing ${bucket} objects failed:`, error.message);
+      return;
+    }
     // Entries without an id are "folders"; the bucket layout is flat under <uid>/.
-    const paths = files.filter((f) => f.id).map((f) => `${prefix}/${f.name}`);
+    const paths = (files ?? []).filter((f) => f.id).map((f) => `${prefix}/${f.name}`);
     if (!paths.length) return;
     const { error: rerr } = await admin.storage.from(bucket).remove(paths);
-    if (rerr) return;
+    if (rerr) {
+      console.error(`delete-account: removing ${bucket} objects failed:`, rerr.message);
+      return;
+    }
   }
+  console.error(`delete-account: ${bucket} still had objects after 100 rounds; leaving the rest to gc-blobs`);
 }
 
 Deno.serve(async (req: Request) => {
@@ -56,7 +64,9 @@ Deno.serve(async (req: Request) => {
   //     below go with them; both together are the user's whole diagnostic footprint.
   try {
     await removeAllUnder(admin, "diagnostic-captures", uid);
-  } catch (_) { /* best-effort — gc-blobs sweeps leftovers */ }
+  } catch (e) {
+    console.error("delete-account: removing diagnostic captures failed:", e instanceof Error ? e.message : e);
+  }
 
   // 2. Delete the user's rows (explicit; safe regardless of FK cascade).
   for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures"]) {
