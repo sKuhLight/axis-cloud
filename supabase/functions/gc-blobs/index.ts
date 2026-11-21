@@ -1,5 +1,5 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "jsr:@supabase/supabase-js@2";
+import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 // Orphan-blob sweep. Quota enforcement is metadata-gated (a preset_versions BEFORE INSERT trigger),
 // so an interrupted or rejected sync can leave a blob in Storage with no metadata row referencing
@@ -7,9 +7,109 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 // cost storage — this function removes any blob not referenced by a blob_path, skipping objects
 // younger than 24 h so it never races an in-flight sync that uploads blob-before-metadata.
 //
+// It also enforces the retention of diagnostic captures (MT): rows past `expires_at` are deleted together
+// with their object in the private `diagnostic-captures` bucket, and objects no row references any more
+// (a crashed upload, or leftovers after account deletion cascaded the rows away) are removed after the same
+// grace window. The result is reported under `diagnostics`.
+//
 // NOT user-facing: gated by a shared secret header (GC_SECRET env), meant for manual invocation or
-// a schedule (pg_cron / dashboard scheduled trigger). Pass ?dry=1 to report without deleting.
+// a schedule (pg_cron / dashboard scheduled trigger; recommended: once a day). Pass ?dry=1 to report
+// without deleting.
 const GRACE_MS = 24 * 60 * 60 * 1000;
+
+const DIAG_BUCKET = "diagnostic-captures";
+// Bounds one run (expired rows are removed oldest-first; the remainder is picked up by the next run).
+const DIAG_MAX_EXPIRED_PER_RUN = 5000;
+
+type Admin = SupabaseClient;
+
+interface DiagnosticsSweep {
+  expiredRows: number;
+  objectsRemoved: number;
+  rowsRemoved: number;
+  orphanObjects: number;
+  orphanObjectsRemoved: number;
+  error?: string;
+}
+
+/** Every entry directly under `prefix` (folders have a null id), paged — storage `list` caps a page. */
+async function listEntries(admin: Admin, bucket: string, prefix: string) {
+  const out: { name: string; id: string | null; created_at: string | null }[] = [];
+  for (let offset = 0; ; offset += 1000) {
+    const { data, error } = await admin.storage.from(bucket).list(prefix, { limit: 1000, offset });
+    if (error) throw error;
+    out.push(...(data ?? []));
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+
+/** Retention for diagnostic captures. Never throws: a failure is reported in `error` so the (independent)
+ *  preset-blob sweep still runs. */
+async function sweepDiagnostics(admin: Admin, dry: boolean): Promise<DiagnosticsSweep> {
+  const res: DiagnosticsSweep = { expiredRows: 0, objectsRemoved: 0, rowsRemoved: 0, orphanObjects: 0, orphanObjectsRemoved: 0 };
+  try {
+    // A. Expired rows (oldest first, bounded per run).
+    const nowIso = new Date().toISOString();
+    const expired: { id: string; object_path: string }[] = [];
+    for (let from = 0; expired.length < DIAG_MAX_EXPIRED_PER_RUN; from += 1000) {
+      const { data, error } = await admin
+        .from("diagnostic_captures")
+        .select("id, object_path")
+        .lt("expires_at", nowIso)
+        .order("expires_at")
+        .order("id")
+        .range(from, from + 999);
+      if (error) throw error;
+      expired.push(...(data ?? []).map((r) => ({ id: r.id as string, object_path: r.object_path as string })));
+      if (!data || data.length < 1000) break;
+    }
+    res.expiredRows = expired.length;
+    if (!dry) {
+      for (let i = 0; i < expired.length; i += 100) {
+        const batch = expired.slice(i, i + 100);
+        // Objects first: if removal fails the rows stay and the next run retries (a missing object is not
+        // an error), so a row is never deleted while its object lives on.
+        const { data: gone, error: oerr } = await admin.storage.from(DIAG_BUCKET).remove(batch.map((r) => r.object_path));
+        if (oerr) continue;
+        res.objectsRemoved += gone?.length ?? 0;
+        const { error: derr } = await admin.from("diagnostic_captures").delete().in("id", batch.map((r) => r.id));
+        if (!derr) res.rowsRemoved += batch.length;
+      }
+    }
+
+    // B. Orphan objects: in the bucket but referenced by no row. Loaded AFTER step A so objects it just
+    //    removed are not listed; the grace window protects an upload between its object and its row.
+    const referenced = new Set<string>();
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await admin.from("diagnostic_captures").select("object_path").order("id").range(from, from + 999);
+      if (error) throw error;
+      for (const r of data ?? []) referenced.add(r.object_path as string);
+      if (!data || data.length < 1000) break;
+    }
+    const cutoff = Date.now() - GRACE_MS;
+    const orphans: string[] = [];
+    for (const folder of (await listEntries(admin, DIAG_BUCKET, "")).filter((e) => !e.id)) {
+      for (const f of (await listEntries(admin, DIAG_BUCKET, folder.name)).filter((e) => e.id)) {
+        const path = `${folder.name}/${f.name}`;
+        if (referenced.has(path)) continue;
+        const created = f.created_at ? Date.parse(f.created_at) : 0;
+        if (created > cutoff) continue; // grace window — may be an upload in flight
+        orphans.push(path);
+      }
+    }
+    res.orphanObjects = orphans.length;
+    if (!dry) {
+      for (let i = 0; i < orphans.length; i += 100) {
+        const { data: gone, error } = await admin.storage.from(DIAG_BUCKET).remove(orphans.slice(i, i + 100));
+        if (!error) res.orphanObjectsRemoved += gone?.length ?? 0;
+      }
+    }
+  } catch (e) {
+    res.error = e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e);
+  }
+  return res;
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
@@ -22,6 +122,10 @@ Deno.serve(async (req: Request) => {
   const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, {
     auth: { persistSession: false }
   });
+
+  // Diagnostic-capture retention first and in isolation, so a problem in the preset-blob sweep below can
+  // never starve it (and vice versa — it never throws).
+  const diagnostics = await sweepDiagnostics(admin, dry);
 
   // Every referenced blob path, across all users (service role bypasses RLS).
   const referenced = new Set<string>();
@@ -58,7 +162,7 @@ Deno.serve(async (req: Request) => {
     }
   }
   return new Response(
-    JSON.stringify({ ok: true, referenced: referenced.size, orphans: orphans.length, removed, dry }),
+    JSON.stringify({ ok: true, referenced: referenced.size, orphans: orphans.length, removed, dry, diagnostics }),
     { headers: { "Content-Type": "application/json" } }
   );
 });
