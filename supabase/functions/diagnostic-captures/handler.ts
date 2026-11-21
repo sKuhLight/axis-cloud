@@ -1,74 +1,115 @@
-// Request handling for `diagnostic-captures`, with every side effect behind `UploadDeps` so the whole
-// flow is testable with in-memory fakes (handler.test.ts). index.ts wires the real Supabase adapter.
+// Request handling for `diagnostic-captures` (signed-upload flow), with every side effect behind `Deps` so
+// the whole flow is testable with in-memory fakes (handler.test.ts). index.ts wires the Supabase adapter.
 //
-//   POST  body = gzip of a CaptureBundle JSON (`schema: 1`), `Content-Type: application/gzip`
-//         (do NOT set `Content-Encoding: gzip`: intermediaries may transparently decode it, and this
-//         function must see — and store — the original gzip bytes)
-//   200   { captureId }                     the diagnostic_captures row id (also for an idempotent repeat,
-//                                           which adds `deduped: true`)
-//   400 { error: 'invalid-gzip' | 'invalid-json' | 'invalid-bundle' | 'empty-body', message }
-//   401 { error: 'unauthorized' }
-//   413 { error: 'too-large', stage: 'compressed' | 'decompressed', limit }
-//   429 { error: 'rate-limited', limit, windowSeconds, retryAfterSeconds }   (+ Retry-After header)
-//   405 { error: 'method-not-allowed' }     500 { error: 'internal' }
+// The function never receives, decompresses or parses the gzip bundle (it can be up to 25 MiB; that is
+// neither safe nor possible inside an edge worker). It only handles small JSON requests:
+//
+//  1. POST  /diagnostic-captures            reserve
+//       { captureId, model, firmware, app?, state?, bytes }   captureId = the bundle's own id (path-safe),
+//                                                             bytes = exact size of the gzip to upload
+//     200 { captureId, status: 'pending', uploadUrl, token, path, bucket, expiresIn }
+//           captureId is the diagnostic_captures ROW id (use it for finalize). Add `deduped: true` when the
+//           bundle id was reserved before (the client retries safely). The client then uploads the gzip to
+//           storage: `PUT uploadUrl` (Content-Type: application/gzip) or storage-js
+//           uploadToSignedUrl(path, token, body, { contentType: 'application/gzip' }).
+//     200 { captureId, deduped: true, status: 'complete' }  already uploaded and confirmed: nothing to do
+//     200 { captureId, deduped: true, status: 'pending' }   reserved and the object is already there (an
+//           earlier attempt uploaded but did not finalize): skip the upload, call finalize
+//  2. POST  /diagnostic-captures/finalize   (or ?action=finalize)
+//       { captureId }   the row id from step 1
+//     200 { captureId, status: 'complete' }  (idempotent)
+//
+//  Errors (JSON { error, message?, ... }):
+//   400 invalid-request | invalid-json | empty-body | invalid-gzip   401 unauthorized
+//   403 account-required (anonymous session)   404 not-found
+//   409 not-uploaded | size-mismatch           413 too-large
+//   429 rate-limited | quota-exceeded  (retryAfterSeconds + Retry-After header)
+//   405 method-not-allowed                     500 internal
 import {
-  type BundleMeta,
-  gunzipCapped,
+  BUCKET,
   isGzip,
-  MAX_COMPRESSED_BYTES,
-  MAX_DECOMPRESSED_BYTES,
+  MAX_JSON_BODY_BYTES,
+  MAX_UPLOAD_BYTES,
   objectPath,
-  RATE_LIMIT_PER_HOUR,
-  RATE_WINDOW_MS,
+  parseFinalizeRequest,
+  parseReserveRequest,
+  QUOTA_BYTES,
+  QUOTA_WINDOW_SECONDS,
+  RATE_LIMIT_PER_WINDOW,
+  RATE_WINDOW_SECONDS,
   readBodyCapped,
-  validateBundle
-} from "./bundle.ts";
+  SIGNED_UPLOAD_TTL_SECONDS
+} from "./validate.ts";
 
-/** The row inserted into public.diagnostic_captures (id / created_at / expires_at are DB defaults). */
-export interface CaptureRow {
-  user_id: string;
-  capture_id: string;
+export interface ReserveArgs {
+  userId: string;
+  captureId: string;
   model: number;
   firmware: string | null;
   app: Record<string, string>;
   state: string;
   bytes: number;
-  object_path: string;
+  maxPerWindow: number;
+  windowSeconds: number;
+  quotaBytes: number;
+  quotaWindowSeconds: number;
 }
 
-export interface UploadDeps {
+export type ReserveResult =
+  | { kind: "ok"; id: string; status: "pending" | "complete"; deduped: boolean }
+  | { kind: "limited"; reason: "rate" | "quota"; retryAfterSeconds: number };
+
+/** The slice of a diagnostic_captures row the handler needs. */
+export interface CaptureRecord {
+  id: string;
+  captureId: string;
+  status: "pending" | "complete";
+  /** Announced size while pending, actual size once complete. */
+  bytes: number;
+  objectPath: string;
+}
+
+export interface Deps {
   /** Resolve the user from the bearer token (Auth server round trip); null = invalid/expired. */
-  authenticate(accessToken: string): Promise<{ id: string } | null>;
-  /** The caller's existing capture with this bundle id, if any (idempotency). */
-  findCapture(userId: string, captureId: string): Promise<{ id: string } | null>;
-  /** created_at (ISO) of the caller's newest captures since `sinceIso`, newest first, at most `limit`. */
-  recentUploads(userId: string, sinceIso: string, limit: number): Promise<string[]>;
-  /** Store the object WITHOUT overwriting. 'exists' = an object is already at that path. */
-  putObject(path: string, body: Uint8Array): Promise<"created" | "exists">;
-  removeObject(path: string): Promise<void>;
-  /** 'conflict' = (user_id, capture_id) already inserted (concurrent identical upload). */
-  insertCapture(row: CaptureRow): Promise<{ id: string } | "conflict">;
-  now?(): number;
+  authenticate(accessToken: string): Promise<{ id: string; isAnonymous: boolean } | null>;
+  /** Atomic dedup + rate limit + quota + insert (the SQL function reserve_diagnostic_capture). */
+  reserve(args: ReserveArgs): Promise<ReserveResult>;
+  /** Signed upload URL for `path` (no overwrite). 'exists' = an object is already at that path. */
+  createUpload(path: string): Promise<{ uploadUrl: string; token: string } | "exists">;
+  /** The caller's own row by row id; null if absent or not theirs. */
+  getCapture(userId: string, rowId: string): Promise<CaptureRecord | null>;
+  /** Metadata of the stored object without downloading it; null if there is no such object. */
+  statObject(path: string): Promise<{ size: number } | null>;
+  /** The first `n` bytes of the object (a range read); null if there is no such object. */
+  readHead(path: string, n: number): Promise<Uint8Array | null>;
+  /** pending -> complete with the actual size; false if the row was not pending any more. */
+  completeCapture(userId: string, rowId: string, bytes: number): Promise<boolean>;
 }
 
 export interface HandlerConfig {
-  maxCompressedBytes: number;
-  maxDecompressedBytes: number;
-  rateLimitPerHour: number;
-  rateWindowMs: number;
+  maxUploadBytes: number;
+  maxJsonBodyBytes: number;
+  rateLimitPerWindow: number;
+  rateWindowSeconds: number;
+  quotaBytes: number;
+  quotaWindowSeconds: number;
 }
 
 export const DEFAULT_CONFIG: HandlerConfig = {
-  maxCompressedBytes: MAX_COMPRESSED_BYTES,
-  maxDecompressedBytes: MAX_DECOMPRESSED_BYTES,
-  rateLimitPerHour: RATE_LIMIT_PER_HOUR,
-  rateWindowMs: RATE_WINDOW_MS
+  maxUploadBytes: MAX_UPLOAD_BYTES,
+  maxJsonBodyBytes: MAX_JSON_BODY_BYTES,
+  rateLimitPerWindow: RATE_LIMIT_PER_WINDOW,
+  rateWindowSeconds: RATE_WINDOW_SECONDS,
+  quotaBytes: QUOTA_BYTES,
+  quotaWindowSeconds: QUOTA_WINDOW_SECONDS
 };
 
 const cors: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, content-type, apikey, x-client-info",
-  "Access-Control-Allow-Methods": "POST, OPTIONS"
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  // Retry-After is not CORS-safelisted: without this a browser client cannot read it on a 429.
+  "Access-Control-Expose-Headers": "Retry-After"
 };
 
 function reply(status: number, body: unknown, extra: Record<string, string> = {}): Response {
@@ -82,105 +123,134 @@ function fail(status: number, error: string, extra: Record<string, unknown> = {}
   return reply(status, { error, ...extra });
 }
 
-export async function handleUpload(
-  req: Request,
-  deps: UploadDeps,
-  cfg: HandlerConfig = DEFAULT_CONFIG
-): Promise<Response> {
+type User = { id: string };
+
+/** Authenticates BEFORE any body is read. Anonymous sessions are real JWTs but not accounts. */
+async function authorize(req: Request, deps: Deps): Promise<{ user: User } | { res: Response }> {
+  const token = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "")?.[1];
+  if (!token) return { res: fail(401, "unauthorized") };
+  const user = await deps.authenticate(token);
+  if (!user) return { res: fail(401, "unauthorized") };
+  if (user.isAnonymous) {
+    return { res: fail(403, "account-required", { message: "diagnostic uploads need a signed-in account, not an anonymous session" }) };
+  }
+  return { user };
+}
+
+/** Reads the (tiny) JSON request body with a hard cap. */
+async function readJson(req: Request, cfg: HandlerConfig): Promise<{ body: unknown } | { res: Response }> {
+  const tooLarge = () => ({ res: fail(413, "too-large", { stage: "request", limit: cfg.maxJsonBodyBytes }) });
+  const declared = Number(req.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > cfg.maxJsonBodyBytes) return tooLarge();
+  const raw = await readBodyCapped(req.body, cfg.maxJsonBodyBytes);
+  if (raw === null) return tooLarge();
+  if (raw.length === 0) return { res: fail(400, "empty-body", { message: "request body is empty" }) };
+  try {
+    return { body: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) };
+  } catch {
+    return { res: fail(400, "invalid-json", { message: "request body is not valid UTF-8 JSON" }) };
+  }
+}
+
+export async function handleRequest(req: Request, deps: Deps, cfg: HandlerConfig = DEFAULT_CONFIG): Promise<Response> {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return reply(405, { error: "method-not-allowed" }, { Allow: "POST, OPTIONS" });
 
-  const now = deps.now ?? Date.now;
-
   try {
-    // ── Authenticate FIRST, before any body is read. ──
-    const token = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "")?.[1];
-    if (!token) return fail(401, "unauthorized");
-    const user = await deps.authenticate(token);
-    if (!user) return fail(401, "unauthorized");
+    const url = new URL(req.url);
+    const finalize = url.pathname.replace(/\/+$/, "").endsWith("/finalize") || url.searchParams.get("action") === "finalize";
 
-    // ── Size: reject on the declared length, then enforce the cap while streaming (a chunked body or a
-    //    lying Content-Length never gets fully buffered). ──
-    const tooLarge = (stage: "compressed" | "decompressed", limit: number) =>
-      fail(413, "too-large", { stage, limit });
-    const declared = Number(req.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > cfg.maxCompressedBytes) {
-      return tooLarge("compressed", cfg.maxCompressedBytes);
-    }
-    const gz = await readBodyCapped(req.body, cfg.maxCompressedBytes);
-    if (gz === null) return tooLarge("compressed", cfg.maxCompressedBytes);
-    if (gz.length === 0) return fail(400, "empty-body", { message: "request body is empty" });
-    if (!isGzip(gz)) {
-      return fail(400, "invalid-gzip", { message: "body must be gzip (Content-Type: application/gzip, no Content-Encoding)" });
-    }
+    const auth = await authorize(req, deps);
+    if ("res" in auth) return auth.res;
+    const body = await readJson(req, cfg);
+    if ("res" in body) return body.res;
 
-    // ── Gunzip (output-capped) → JSON → shape. ──
-    const unzipped = await gunzipCapped(gz, cfg.maxDecompressedBytes);
-    if (!unzipped.ok) {
-      return unzipped.reason === "too-large"
-        ? tooLarge("decompressed", cfg.maxDecompressedBytes)
-        : fail(400, "invalid-gzip", { message: "body is not a valid gzip stream" });
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(unzipped.data));
-    } catch {
-      return fail(400, "invalid-json", { message: "decompressed body is not valid UTF-8 JSON" });
-    }
-    const checked = validateBundle(parsed);
-    if (!checked.ok) return fail(400, "invalid-bundle", { message: checked.message });
-    const meta: BundleMeta = checked.meta;
-
-    // ── Idempotent repeat: the same bundle id from the same user returns the stored row. Checked BEFORE
-    //    the rate limit so a retry after a lost response is never throttled. ──
-    const existing = await deps.findCapture(user.id, meta.captureId);
-    if (existing) return reply(200, { captureId: existing.id, deduped: true });
-
-    // ── Rate limit: at most N NEW captures per user per rolling window. ──
-    const since = new Date(now() - cfg.rateWindowMs).toISOString();
-    const recent = await deps.recentUploads(user.id, since, cfg.rateLimitPerHour);
-    if (recent.length >= cfg.rateLimitPerHour) {
-      // The slot frees up when the oldest of the counted uploads leaves the window.
-      const oldest = Date.parse(recent[cfg.rateLimitPerHour - 1]);
-      const retryAfterSeconds = Math.max(1, Math.ceil((oldest + cfg.rateWindowMs - now()) / 1000));
-      return reply(
-        429,
-        { error: "rate-limited", limit: cfg.rateLimitPerHour, windowSeconds: cfg.rateWindowMs / 1000, retryAfterSeconds },
-        { "Retry-After": String(retryAfterSeconds) }
-      );
-    }
-
-    // ── Store the ORIGINAL gzip bytes, then the metadata row. ──
-    const path = objectPath(user.id, meta.captureId);
-    const put = await deps.putObject(path, gz);
-    let inserted: { id: string } | "conflict";
-    try {
-      inserted = await deps.insertCapture({
-        user_id: user.id,
-        capture_id: meta.captureId,
-        model: meta.model,
-        firmware: meta.firmware,
-        app: meta.app,
-        state: meta.state,
-        bytes: gz.length,
-        object_path: path
-      });
-    } catch (e) {
-      // Don't leave an unreferenced object behind (only one WE created; an 'exists' object belongs to an
-      // earlier attempt). The gc-blobs sweep also removes orphans if this cleanup fails.
-      if (put === "created") await deps.removeObject(path).catch(() => {});
-      throw e;
-    }
-    if (inserted === "conflict") {
-      // A concurrent identical upload won the insert race — answer with its row.
-      const winner = await deps.findCapture(user.id, meta.captureId);
-      if (!winner) throw new Error("capture insert conflict but no existing row");
-      return reply(200, { captureId: winner.id, deduped: true });
-    }
-    return reply(200, { captureId: inserted.id });
+    return finalize
+      ? await finalizeCapture(auth.user, body.body, deps, cfg)
+      : await reserveCapture(auth.user, body.body, deps, cfg);
   } catch (e) {
     // Details go to the function log (maintainer-only), never to the client.
     console.error("diagnostic-captures:", e instanceof Error ? e.message : e);
-    return fail(500, "internal", { message: "upload failed; please try again later" });
+    return fail(500, "internal", { message: "request failed; please try again later" });
   }
+}
+
+async function reserveCapture(user: User, rawBody: unknown, deps: Deps, cfg: HandlerConfig): Promise<Response> {
+  const parsed = parseReserveRequest(rawBody, cfg.maxUploadBytes);
+  if (!parsed.ok) {
+    return fail(parsed.status, parsed.error, { message: parsed.message, ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}) });
+  }
+  const r = parsed.value;
+
+  // Atomic in the database: dedup, rate limit, byte quota, insert (per-user lock — parallel requests
+  // cannot race past the limits).
+  const reserved = await deps.reserve({
+    userId: user.id,
+    captureId: r.captureId,
+    model: r.model,
+    firmware: r.firmware,
+    app: r.app,
+    state: r.state,
+    bytes: r.bytes,
+    maxPerWindow: cfg.rateLimitPerWindow,
+    windowSeconds: cfg.rateWindowSeconds,
+    quotaBytes: cfg.quotaBytes,
+    quotaWindowSeconds: cfg.quotaWindowSeconds
+  });
+  if (reserved.kind === "limited") {
+    const retryAfterSeconds = Math.max(1, Math.ceil(reserved.retryAfterSeconds));
+    const headers = { "Retry-After": String(retryAfterSeconds) };
+    return reserved.reason === "rate"
+      ? reply(429, { error: "rate-limited", limit: cfg.rateLimitPerWindow, windowSeconds: cfg.rateWindowSeconds, retryAfterSeconds }, headers)
+      : reply(429, { error: "quota-exceeded", quotaBytes: cfg.quotaBytes, windowSeconds: cfg.quotaWindowSeconds, retryAfterSeconds }, headers);
+  }
+  if (reserved.status === "complete") {
+    return reply(200, { captureId: reserved.id, deduped: true, status: "complete" });
+  }
+
+  // Pending: hand out the signed upload URL (or point at finalize if the object is already there).
+  const path = objectPath(user.id, r.captureId);
+  const upload = await deps.createUpload(path);
+  const dedupedField = reserved.deduped ? { deduped: true } : {};
+  if (upload === "exists") return reply(200, { captureId: reserved.id, status: "pending", ...dedupedField });
+  return reply(200, {
+    captureId: reserved.id,
+    status: "pending",
+    ...dedupedField,
+    uploadUrl: upload.uploadUrl,
+    token: upload.token,
+    path,
+    bucket: BUCKET,
+    expiresIn: SIGNED_UPLOAD_TTL_SECONDS
+  });
+}
+
+async function finalizeCapture(user: User, rawBody: unknown, deps: Deps, cfg: HandlerConfig): Promise<Response> {
+  const parsed = parseFinalizeRequest(rawBody);
+  if (!parsed.ok) return fail(parsed.status, parsed.error, { message: parsed.message });
+  const { rowId } = parsed.value;
+
+  const row = await deps.getCapture(user.id, rowId);
+  if (!row) return fail(404, "not-found");
+  if (row.status === "complete") return reply(200, { captureId: row.id, status: "complete" });
+
+  // Checks on the stored object — metadata and 2 bytes only; the bundle is never downloaded or parsed here.
+  const stat = await deps.statObject(row.objectPath);
+  if (!stat) return fail(409, "not-uploaded", { message: "no object has been uploaded for this capture yet" });
+  if (stat.size > cfg.maxUploadBytes) return fail(413, "too-large", { stage: "stored", limit: cfg.maxUploadBytes });
+  // The quota was reserved for the announced size: an object larger than announced is refused (smaller is fine
+  // and frees the difference). The object is left in place; gc-blobs removes it with the pending row.
+  if (stat.size > row.bytes) return fail(409, "size-mismatch", { announced: row.bytes, actual: stat.size });
+  if (stat.size < 2) return fail(400, "invalid-gzip", { message: "stored object is not a gzip file" });
+  const head = await deps.readHead(row.objectPath, 2);
+  if (!head) return fail(409, "not-uploaded", { message: "no object has been uploaded for this capture yet" });
+  if (!isGzip(head)) return fail(400, "invalid-gzip", { message: "stored object is not a gzip file" });
+
+  const done = await deps.completeCapture(user.id, row.id, stat.size);
+  if (!done) {
+    // Not pending any more: a concurrent finalize won (fine) or the row was swept in the meantime.
+    const again = await deps.getCapture(user.id, row.id);
+    if (!again || again.status !== "complete") return fail(404, "not-found");
+  }
+  return reply(200, { captureId: row.id, status: "complete" });
 }
