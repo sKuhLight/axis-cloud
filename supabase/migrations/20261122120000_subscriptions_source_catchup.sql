@@ -1,0 +1,18 @@
+-- Catch-up: make sure public.subscriptions has the `source` column.
+--
+-- WHY: 20260630120000_init.sql declares `subscriptions.source text` ('patreon', provider-neutral for a
+-- future switch). A project whose schema was created through the dashboard before init existed in its
+-- current form has a subscriptions table WITHOUT that column, and `create table if not exists` in init
+-- never adds a missing column to a table that is already there. Such a project records init as applied
+-- in its migration history, so init will not run again; nothing else would ever add the column, and
+-- anything that writes or reads subscriptions.source (the supporter link/webhook, the maintainer's manual
+-- grants) fails with 42703 "column does not exist".
+--
+-- WHAT: add the column if it is missing. No-op wherever init created the table (every fresh project and
+-- local stack). Idempotent, so re-running is safe. Nullable with no default, exactly as in init, so
+-- existing rows are untouched.
+--
+-- GRANTS: nothing to add. 20261121150000_explicit_grants.sql grants subscriptions at table level
+-- (SELECT to authenticated; SELECT, INSERT, UPDATE, DELETE to service_role), and a table-level privilege
+-- covers columns added later. RLS is unaffected: it is row-level.
+alter table public.subscriptions add column if not exists source text;

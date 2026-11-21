@@ -18,6 +18,7 @@ supabase/
     20261121120000_diagnostic_captures.sql  # opt-in diagnostic uploads: maintainer-only table + private bucket
     20261121130000_diagnostic_captures_signed_upload.sql  # status, atomic reserve function (limits, quota), bucket re-assert
     20261121140000_diagnostic_reserve_pending_charge.sql  # reserve: pending charged at the cap, refresh/recreate of pending rows
+    20261122120000_subscriptions_source_catchup.sql  # adds subscriptions.source where an older project lacks it (no-op elsewhere)
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
 ```
 
