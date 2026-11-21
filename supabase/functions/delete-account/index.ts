@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
+import { corsHeaders } from "../_shared/cors.ts";
 
 // GDPR Art. 17 — erase the caller's account + all their data. JWT-gated (verify_jwt); the caller is
 // identified from their own token, so a user can only ever delete themselves. Runs with the service role
@@ -31,11 +32,7 @@ async function removeAllUnder(admin: Admin, bucket: string, prefix: string): Pro
 }
 
 Deno.serve(async (req: Request) => {
-  const cors: Record<string, string> = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "authorization, content-type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS"
-  };
+  const cors = corsHeaders("POST, OPTIONS");
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return new Response("method not allowed", { status: 405, headers: cors });
 
