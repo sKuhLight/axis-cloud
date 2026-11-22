@@ -32,6 +32,21 @@ supabase/
   public/anon (advisor hardening) — deliberate; do not loosen.
 - `…_device_profiles.sql` — shared, public-read `device_profiles` (NOT user data);
   writes are service-role-only (no client write policy).
+- `…_diagnostic_captures.sql`, `…_diagnostic_captures_signed_upload.sql`,
+  `…_diagnostic_reserve_pending_charge.sql` — maintainer-only `diagnostic_captures` (RLS on, no
+  policy, privileges revoked) + private `diagnostic-captures` bucket; `reserve_diagnostic_capture()`
+  (security definer, service_role only: dedup, rate limit, byte quota with pending charged at the cap,
+  refresh/recreate of pending rows; SQLSTATEs `XQ001`/`XQ002`).
+- `…_explicit_grants.sql` — explicit Data API privileges for projects created with the secure
+  defaults (no implicit grants); `device_profiles.created_by` withheld from clients.
+- `…_subscriptions_source_catchup.sql` — adds `subscriptions.source` where an older project lacks it.
+- `…_editor_cache_uploads.sql` — editor-cache contributions: `editor_cache_uploads` (no IP, no
+  e-mail), `editor_cache_coverage` (contributors = distinct uploaders, once per network key),
+  `editor_cache_ip_usage` (HMAC'd network keys; kept while their upload exists, unlinked ones pruned at
+  30 d), all deny-by-default; private `editor-caches` bucket; `reserve_editor_cache_upload()`
+  (`XQ001`–`XQ006`), `complete_editor_cache_upload()`, `set_editor_cache_coverage()` — service_role only.
+- `…_anonymous_session_hardening.sql` — restrictive policies keeping cloud sync, `preset-blobs` and the
+  Remote channel closed to Supabase anonymous sessions (anonymous sign-ins are on for editor caches).
 
 **Edge functions** (`supabase/functions/*/index.ts`, Deno + `supabase-js`):
 - `delete-account` — GDPR erase. `verify_jwt = true`; identifies the caller from their
@@ -40,17 +55,32 @@ supabase/
   deletes `preset-blobs` objects not referenced by any `preset_versions.blob_path`,
   skipping objects <24 h old. `?dry=1` reports without deleting.
 - `device-profiles` — shared profile store. `verify_jwt = false` (GET is public); POST
-  verifies the JWT manually, validates + size-caps the body, computes the content hash
-  server-side, rate-limits, and inserts with the service role.
+  verifies the JWT manually (anonymous sessions refused), validates + size-caps the body, computes
+  the content hash server-side, rate-limits, and inserts with the service role.
+- `diagnostic-captures` — opt-in diagnostic upload, signed-upload flow (reserve → client uploads
+  to storage → finalize checks size + gzip magic). `verify_jwt = false`, handler authenticates;
+  anonymous sessions refused. Logic in `handler.ts`/`validate.ts` behind a `Deps` seam.
+- `editor-caches` — editor definitions-cache contributions, same signed-upload pattern. Public
+  `GET ?model&firmware` → `{ wanted }`; reserve / finalize / delete / `GET /mine` for accounts AND
+  anonymous sessions. Finalize hashes the stored object and runs a structure + redaction check of the
+  cache (`validate.ts`, self-contained mirror of the codec's walker + a plausibility floor) before
+  accepting. Per-uploader and per-network limits; secrets `EDITOR_CACHE_IP_SALT` (required, ≥ 32
+  chars), `EDITOR_CACHE_UPLOADS=off`, `EDITOR_CACHE_IP_HEADERS` (pin after a staging check).
+- `gc-blobs` also sweeps both private upload stores (`sweepPrivateUploads`), prunes unlinked
+  editor-cache network counters, and deletes anonymous auth users without uploads after
+  `ANONYMOUS_USER_IDLE_DAYS` (default 30) via the Auth admin API.
 
-**Storage buckets:** `preset-blobs` (private, per-user path RLS, per-object size cap) and
-`debug-reports` (private, insert-only).
+**Storage buckets:** `preset-blobs` (private, per-user path RLS, per-object size cap),
+`debug-reports` (private, insert-only), `diagnostic-captures` and `editor-caches` (private, no
+storage policy — signed upload URLs from the edge functions only).
 
 **RLS / quota model:** every user table has RLS with `auth.uid() = user_id`, so the anon/
 publishable key is safe to expose — RLS protects every row. Quotas are enforced by a
 `SECURITY DEFINER` trigger as a backstop (the client pre-flights); paid users
 (`subscriptions.active` within period) bypass. `device_profiles` is the one public-read,
-service-role-write table (shared derived data, not user data).
+service-role-write table (shared derived data, not user data). **Anonymous sign-ins are enabled**
+(editor caches): an anonymous session is role `authenticated` with `is_anonymous: true`, so any new
+account-only policy or function must refuse it explicitly (see the hardening migration).
 
 ## Commands (Supabase CLI)
 
@@ -62,10 +92,11 @@ No local CLI, Deno, or Docker is assumed — invoke the CLI through `npx`:
 - `npx --yes supabase@latest db diff` — diff the local DB vs migrations (to author a new one).
 - `npx --yes supabase@latest status` — inspect the running local stack.
 
-**There is no cheap automated test gate in this repo yet** — no package.json, no CI, no
-unit tests. Verification today means running the local stack (Docker) and exercising the
-functions/SQL by hand. Do not claim a passing gate that does not exist. (Follow-up
-tracked in Plane.)
+**There is no automated test gate (no CI) in this repo yet.** What exists: Deno unit tests
+that need no stack — `deno test supabase/functions/editor-caches/ supabase/functions/diagnostic-captures/ supabase/functions/_shared/`
+(Deno is not assumed installed; any Deno 2 works) — and pgTAP suites under
+`supabase/tests/database/` that need the Docker-gated local stack (`… test db`). Do not claim a
+passing gate that does not exist. (Follow-up tracked in Plane.)
 
 Remote-mutating ops (`db push`, `functions deploy`, `secrets set`, `link`) target a
 linked/hosted project — never run them unattended; a Bash guard hook blocks them.
@@ -107,7 +138,8 @@ linked/hosted project — never run them unattended; a Bash guard hook blocks th
   on a project drifts from the tracked schema.
 - **Quota functions were deliberately hardened** (EXECUTE revoked from public/anon);
   don't "fix" that by re-granting.
-- **No test gate** — a green typecheck/test does not exist; don't imply one.
+- **No CI gate** — the Deno unit tests run only when someone runs them, and the pgTAP suites need
+  the local stack; report exactly which of them you ran, never "the gate is green".
 
 ## Git and commits
 

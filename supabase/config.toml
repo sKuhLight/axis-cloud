@@ -22,6 +22,18 @@ additional_redirect_urls = [
   "https://axisapp.live/auth/confirmed",
   "http://localhost:5173/auth/confirmed"  # local dev (set AXIS_AUTH_CONFIRM_URL to match)
 ]
+# Anonymous sign-ins: editor-cache uploads (functions/editor-caches) accept a per-install Supabase ANONYMOUS
+# session as the uploader identity (no e-mail, no CAPTCHA). This switch is PROJECT-WIDE — an anonymous user gets a
+# normal `authenticated` JWT with `is_anonymous: true` — so account-only features refuse such sessions explicitly
+# (migration …_anonymous_session_hardening.sql; device-profiles and diagnostic-captures check it in code).
+# Hosted project: apply the migrations FIRST, then enable it under Dashboard → Authentication → Sign In / Providers.
+enable_anonymous_sign_ins = true
+
+[auth.rate_limit]
+# Anonymous sign-ins per hour per IP address (the Supabase default, pinned here so it is a reviewed value). The
+# editor-caches function limits uploads per network on top of this.
+anonymous_users = 30
+
 [auth.email]
 enable_signup = true
 enable_confirmations = true
@@ -55,4 +67,12 @@ verify_jwt = false
 # same `{ "error": "unauthorized" }` body — the platform check answers with its own, differently shaped
 # body — and token verification does not depend on the project's JWT-signing mode. Writes use the service
 # role.
+verify_jwt = false
+
+[functions.editor-caches]
+# Editor definitions-cache contributions (MP; signed-upload flow: reserve + finalize + delete, small JSON requests).
+# JWT verification is OFF at the platform layer: the status GET (`wanted` yes/no) is public, and every other
+# request is authenticated by the handler itself (Auth server getUser) before it reads anything — accounts AND
+# anonymous sessions are accepted by design. Writes use the service role. Function secrets (never here):
+# EDITOR_CACHE_IP_SALT (required), EDITOR_CACHE_UPLOADS=off (kill switch) — see README "Editor-cache uploads".
 verify_jwt = false

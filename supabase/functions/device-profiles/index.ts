@@ -128,6 +128,12 @@ Deno.serve(async (req: Request) => {
     const userClient = createClient(url, anon, { global: { headers: { Authorization: authHeader } } });
     const { data: { user }, error: uerr } = await userClient.auth.getUser();
     if (uerr || !user) return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: json });
+    // Publishing to the SHARED store needs an account. Anonymous sessions (enabled project-wide for editor-cache
+    // uploads) are valid JWTs too, and can be minted at will — they would make the per-user rate limit below
+    // meaningless for a store whose rows every client downloads.
+    if (user.is_anonymous === true) {
+      return new Response(JSON.stringify({ error: "account-required" }), { status: 403, headers: json });
+    }
 
     // Cheap pre-parse size guard (Content-Length is advisory but bounds the common case).
     const len = Number(req.headers.get("Content-Length") ?? 0);

@@ -10,8 +10,8 @@ type Admin = SupabaseClient;
 
 // Removes every object under `<prefix>/` in a bucket, paging until it is empty. Best-effort like the rest of
 // this function: a failure is LOGGED and stops the loop (the account deletion still proceeds). For the
-// diagnostic-captures bucket the gc-blobs sweep then removes the leftovers: once their rows are gone they are
-// unreferenced, and it deletes unreferenced objects older than 24 h on its next scheduled run.
+// diagnostic-captures and editor-caches buckets the gc-blobs sweep then removes the leftovers: once their rows are
+// gone they are unreferenced, and it deletes unreferenced objects older than 24 h on its next scheduled run.
 async function removeAllUnder(admin: Admin, bucket: string, prefix: string): Promise<void> {
   for (let round = 0; round < 100; round++) {
     const { data: files, error } = await admin.storage.from(bucket).list(prefix, { limit: 1000 });
@@ -65,8 +65,17 @@ Deno.serve(async (req: Request) => {
     console.error("delete-account: removing diagnostic captures failed:", e instanceof Error ? e.message : e);
   }
 
-  // 2. Delete the user's rows (explicit; safe regardless of FK cascade).
-  for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures"]) {
+  // 1c. Remove the user's editor-cache uploads (<uid>/<sha256>.cache). Works the same for an anonymous session —
+  //     that is how an anonymous uploader erases everything at once. Leftovers are swept by gc-blobs as above.
+  try {
+    await removeAllUnder(admin, "editor-caches", uid);
+  } catch (e) {
+    console.error("delete-account: removing editor-cache uploads failed:", e instanceof Error ? e.message : e);
+  }
+
+  // 2. Delete the user's rows (explicit; safe regardless of FK cascade). Deleting editor_cache_uploads clears the
+  //    link of its per-network rate-limit counters (they carry no user id and age out after 30 days).
+  for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures", "editor_cache_uploads"]) {
     await admin.from(table).delete().eq("user_id", uid);
   }
 

@@ -18,7 +18,11 @@ supabase/
     20261121120000_diagnostic_captures.sql  # opt-in diagnostic uploads: maintainer-only table + private bucket
     20261121130000_diagnostic_captures_signed_upload.sql  # status, atomic reserve function (limits, quota), bucket re-assert
     20261121140000_diagnostic_reserve_pending_charge.sql  # reserve: pending charged at the cap, refresh/recreate of pending rows
+    20261121150000_explicit_grants.sql  # explicit Data API privileges (projects created with the secure defaults)
     20261122120000_subscriptions_source_catchup.sql  # adds subscriptions.source where an older project lacks it (no-op elsewhere)
+    20261123120000_editor_cache_uploads.sql  # editor-cache contributions: uploads, coverage, network counters, bucket, reserve/complete
+    20261123130000_anonymous_session_hardening.sql  # keeps account-only features closed to anonymous sessions
+  functions/                  # Deno edge functions: delete-account, gc-blobs, device-profiles, diagnostic-captures, editor-caches
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
 ```
 
@@ -208,9 +212,210 @@ curl -s -X DELETE "$SUPABASE_URL/rest/v1/diagnostic_captures?id=eq.<row-id>" \
 Supabase stack needed) and, on a local stack, `npx --yes supabase@latest test db` (pgTAP: the reservation
 function, limits, grants, constraints, deny-by-default access).
 
+## Editor-cache uploads (opt-in contributions, maintainer-only)
+When Axis meets a device firmware it has no definitions for, the user can contribute the **definitions cache file
+the official Fractal editor saved on their computer** for that device (`effectDefinitions_<model>_<major>p<minor>.cache`)
+so the maintainer can prepare a definitions update without an app release. It is never sent automatically: the
+user reviews what is sent and ticks an explicit consent first. Only gen-3 devices contribute (Axe-Fx III `0x10`,
+FM3 `0x11`, FM9 `0x12`), and only while a firmware is still wanted.
+
+**Who can upload:** a signed-in account **or a Supabase anonymous session** (a per-install anonymous auth user
+created by Supabase Auth — no e-mail, no CAPTCHA; its id is unrelated to any telemetry id). Both can list and
+delete their own uploads. Anonymous sign-ins must be enabled on the project, which is a **project-wide** switch:
+see "Anonymous sessions" below.
+
+> **Deploy gate (all before a client build that uploads ships):**
+> 1. Apply the migrations (`supabase db push`), **then** enable anonymous sign-ins (Dashboard → Authentication →
+>    Sign In / Providers) — never the other way round.
+> 2. Set the function secret `EDITOR_CACHE_IP_SALT` to a random value of **at least 32 characters** (e.g. 64 hex
+>    digits: `supabase secrets set EDITOR_CACHE_IP_SALT=<random>`; never commit it). Missing or shorter, the function
+>    fails closed: `wanted: false`, uploads `503 paused`.
+> 3. Deploy `editor-caches`, `gc-blobs`, `delete-account` and `device-profiles`.
+> 4. The daily `gc-blobs` schedule must exist (see "Diagnostic captures") — it enforces the retention below and
+>    deletes idle anonymous users.
+> 5. **Pin the client-address header** on staging first (see "Limits": the first reservation per worker logs which
+>    address headers arrived — names only), then set `EDITOR_CACHE_IP_HEADERS` to that one header in production.
+> 6. Mark the firmwares the maintainer already has as covered (SQL under "Coverage"), so nobody is asked for them.
+
+**What is stored**
+- **Object** — the uploaded file, **redacted on the user's machine before upload**: every byte of the user's own
+  names (preset names, user cab names) is replaced with `_`, lengths unchanged; everything else is the editor's
+  firmware definitions. Private `editor-caches` bucket at `<user_id>/<sha256>.cache` (4 MiB cap,
+  `application/octet-stream`, no storage policy).
+- **Row** in `editor_cache_uploads` — `user_id` (the auth user id, anonymous or account), `model`,
+  `device_firmware` (as the device reports it), `file_version` (from the file name), `content_version` (the
+  file's own header version, **read by the server** at finalize), generated `version_match`, `file_name`,
+  `sha256`, `bytes`, `redaction` counts (`{ version, tables, names }`), sanitized client validation numbers
+  (`summary`), version stamps (`app`, version-like strings only), `consent_at` + `consent_version`, `status`,
+  `created_at`, `expires_at`. **No IP address, no e-mail, no file path, no host name, no telemetry id.**
+- **Network counters** in `editor_cache_ip_usage` — an HMAC-SHA256 of the client's network (IPv4 address or IPv6
+  /64) under `EDITOR_CACHE_IP_SALT`, never the address itself; no user id. Used for the per-network limits and so
+  that coverage counts one network only once. Kept while the upload it belongs to exists (≤ 180 days); once the
+  upload is gone it is unlinked and deleted when it is older than 30 days (the longest limit window).
+- **Coverage** in `editor_cache_coverage` — per `(model, firmware)`: `collecting | covered | closed` and a
+  contributor count. No user data.
+
+**Who can read it:** only the **service role** (maintainer, edge functions). All three tables have RLS on with no
+policy and their privileges revoked from `anon`/`authenticated`. Uploaders see their own uploads only through the
+function's listing (no file content).
+
+**Server-side check before an upload is accepted** (finalize; anything else is `422 invalid-cache`, and the stored
+object is deleted at once): the stored bytes must hash to the announced `sha256`; be at most 4 MiB; and be a
+complete editor definitions cache as observed in the gen-3 editors' files — a 46-byte header whose version
+(`u32` major/minor) equals the version in the file name and whose section count equals the sections that
+follow; every section and record walks cleanly to the end of the file (the record grammar of the public
+[forgefx-midi](https://github.com/sKuhLight/forgefx-midi) cache walker, strict mode); and every name in the
+user-name tables (preset names, user/scratchpad cab banks, unknown special tables) is empty or all `_`. On top, a
+**plausibility floor** — at least 32 KiB, 16 sections, 500 records and a preset-name table (real caches of the
+contributing devices: 278–329 KB, 45–57 sections, ~2,500–2,900 records) — so tiny hand-made files that walk
+cleanly cannot be used to cover a firmware. The file name must also be the editor's own name and agree with the
+claimed model and file version (`400` at reserve). Rules and reasons: `supabase/functions/editor-caches/validate.ts`.
+
+**Flow** — the function `editor-caches` handles small JSON requests only; the file goes straight from the client
+to storage via a signed upload URL. Authenticated calls carry `Authorization: Bearer <access token>` (account or
+anonymous session); `verify_jwt` is off because the status call is public and the handler verifies tokens itself.
+
+0. **Status (public)** — `GET /functions/v1/editor-caches?model=17&firmware=13.0` →
+   `200 { model, firmware, wanted }` (`Cache-Control: public, max-age=600`). `wanted` is false when uploads are
+   paused, the model cannot contribute, or the firmware is covered/closed. Nothing else is revealed.
+1. **Reserve** — `POST /functions/v1/editor-caches` with
+   `{ model, deviceFirmware, fileVersion, contentVersion?, fileName, sha256, bytes, redaction: { version, tables, names }, summary?, app?, consentAt, consentVersion }`
+   (`sha256` of the bytes to upload, `bytes` their exact size, `consentAt` ISO within ±24 h of server time,
+   `consentVersion` ≥ 2 — the first disclosure text that covers uploads without an account; `app` stamps must look
+   like versions, e.g. `0.9.0-beta`). Answers `200 { uploadId, status: 'pending', uploadUrl, token, path, bucket, expiresIn }`;
+   `{ uploadId, status: 'complete', deduped: true }` (you sent this file already); `{ uploadId: null, status: 'complete', deduped: true }`
+   (someone else sent the identical file — nothing is stored); `{ uploadId, status: 'pending', deduped: true }` without
+   `uploadUrl` (the object is already there — finalize). Pending reservations refresh/recreate exactly like
+   diagnostic captures (new row after ~20 h).
+2. **Upload** — `supabase.storage.from('editor-caches').uploadToSignedUrl(path, token, bytes, { contentType: 'application/octet-stream' })`
+   (or `PUT uploadUrl`; on a local stack the URL may point at the internal host — use `path` + `token`).
+3. **Finalize** — `POST /functions/v1/editor-caches/finalize` with `{ uploadId }` → `200 { uploadId, status: 'complete', covered }`
+   (`covered`: the firmware is no longer collecting). Runs the server-side check above.
+4. **Delete (self-service)** — `POST /functions/v1/editor-caches/delete` with `{ uploadId }` → `200 { uploadId, deleted: true }`
+   (own uploads only, else `404`; object first, then the row; works while paused).
+5. **My uploads** — `GET /functions/v1/editor-caches/mine` → `200 { uploads: [{ uploadId, model, deviceFirmware, fileVersion, contentVersion, versionMatch, fileName, sha256, bytes, status, createdAt, expiresAt }] }`.
+
+| Status | Body `error` | When |
+|---|---|---|
+| 400 | `invalid-request`, `invalid-json`, `empty-body`, `consent-required` | malformed request; renamed/foreign file name; consent fields missing, out of range, or for a disclosure text older than version 2 |
+| 401 | `unauthorized` | missing, invalid or expired token |
+| 403 | `account-required` | reserve/finalize by an anonymous session while `EDITOR_CACHE_ALLOW_ANONYMOUS=0` (listing and deleting stay open) |
+| 404 | `not-found` | no such upload for this uploader |
+| 409 | `not-uploaded`, `size-mismatch`, `hash-mismatch`, `not-wanted`, `firmware-limit` | finalize before upload / object larger than announced / bytes do not match `sha256` (object deleted) / firmware covered or closed, or a model that cannot contribute / 2 uploads for this firmware already |
+| 413 | `too-large` | `bytes` above 4 MiB, a request body above 8 KiB, or a stored object above 4 MiB |
+| 422 | `invalid-cache` (+ `reason`: `size`, `implausible`, `header-version`, `version-mismatch`, `section-count`, `structure`, `too-complex`, `not-redacted`) | the stored file failed the server-side check (object deleted) |
+| 429 | `rate-limited`, `quota-exceeded` (+ `scope`: `uploader` or `ip`) | see limits; `retryAfterSeconds` in the body, `Retry-After` header (CORS-exposed) |
+| 503 | `paused` | `EDITOR_CACHE_UPLOADS=off`, or `EDITOR_CACHE_IP_SALT` missing / shorter than 32 characters |
+| 500 | `internal` | storage/database failure (details only in the function log) |
+
+**Limits** (constants in `validate.ts`, enforced atomically in `reserve_editor_cache_upload`):
+
+| Limit | Value |
+|---|---|
+| File size | 4 MiB (bucket enforces it too) |
+| Rate | 5 new uploads per hour — per uploader **and** per client network |
+| Volume | 20 MiB per 30 days — per uploader **and** per client network; an unconfirmed reservation counts at the full 4 MiB until finalize records the real size |
+| Per firmware | 2 uploads per (uploader, model, firmware) |
+| Coverage | covered after **2 distinct uploaders on 2 distinct networks** with a complete, version-matched upload |
+| Signed upload URL | 2 h; pending refresh max age 20 h; gc grace 24 h |
+
+Anonymous uploader ids cost nothing to mint, so the **per-network** limits are the ones that bind an abuser; their
+counters outlive deleted uploads, so deleting and re-uploading does not reset them. By default the client network is
+read from `cf-connecting-ip`, then `x-real-ip`, then the **last** `x-forwarded-for` entry (earlier entries are
+client-supplied). Which of these the hosted platform actually sets, and whether a client can forge it, is **not
+verified yet**: the first reservation each worker serves logs which address headers were present and how many
+`x-forwarded-for` entries there were (header names and a count — never values), and a request without any usable
+address logs a warning and is limited in one shared bucket. Check that log on staging (requests from two different
+networks must produce two different counters; a forged `x-forwarded-for` must change nothing), then **pin**
+`EDITOR_CACHE_IP_HEADERS` to the one header the platform's proxy sets. A self-hosted deployment does the same for
+its own proxy.
+
+**Coverage ("stop asking").** A firmware becomes `covered` automatically once 2 distinct uploaders (anonymous ids
+count) on 2 distinct networks have a complete upload whose file version (name or header) equals the device
+firmware — `contributors` = distinct uploaders, counted at most once per network key, so one network cannot cover
+a firmware alone. Uploads of an older/other file are stored but never count. The maintainer manages coverage with
+a service-role-only function (SQL editor; the firmware is normalized, `'32.06'` → `'32.6'`):
+
+```sql
+select public.set_editor_cache_coverage(17, '13.0', 'covered');     -- stop asking (FM3 = 17 = 0x11, firmware 13.0)
+select public.set_editor_cache_coverage(17, '14.0', 'closed');      -- never collect (e.g. a beta)
+select public.set_editor_cache_coverage(17, '13.0', 'collecting');  -- reopen: count restarts; only uploads from now on count
+select model, device_firmware, state, contributors, updated_at from public.editor_cache_coverage order by 1, 2;
+```
+
+Nothing is pre-marked by the migrations (a local `db reset` starts with every firmware wanted, which the manual
+acceptance run relies on); on the hosted project the maintainer runs one `covered` line per firmware he already
+has, after `db push` and before the client ships. Global stop: `supabase secrets set EDITOR_CACHE_UPLOADS=off`.
+
+**Retention and deletion.** `expires_at` = `created_at + 180 days`; `gc-blobs` removes expired uploads with their
+objects, reservations still pending after 24 h, unreferenced objects older than 24 h (reported under
+`editorCaches`), network counters no upload references any more once they are older than 30 days
+(`editorCacheNetworkCounters`), and anonymous auth users without uploads (see "Anonymous sessions";
+`anonymousUsers`). An uploader deletes a single upload with `POST …/editor-caches/delete`; `delete-account` (also
+callable with an anonymous session) removes all objects and rows of the caller and the auth user — leftovers are
+swept by `gc-blobs` like diagnostic captures. Coverage is a high-water mark and is not lowered by deletions (it
+holds no user data).
+
+**Reading uploads (maintainer, service role):**
+
+```bash
+# list complete uploads, newest first (filter e.g. &model=eq.17&device_firmware=eq.13.0&version_match=is.true)
+curl -s "$SUPABASE_URL/rest/v1/editor_cache_uploads?select=id,model,device_firmware,file_version,content_version,version_match,file_name,sha256,bytes,redaction,summary,created_at,expires_at&status=eq.complete&order=created_at.desc&limit=50" \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+
+# download one (path = <user_id>/<sha256>.cache, the row's object_path)
+curl -s -o upload.cache "$SUPABASE_URL/storage/v1/object/authenticated/editor-caches/<user_id>/<sha256>.cache" \
+  -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+
+# delete one on request: the object, then the row
+curl -s -X DELETE "$SUPABASE_URL/storage/v1/object/editor-caches/<user_id>/<sha256>.cache" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+curl -s -X DELETE "$SUPABASE_URL/rest/v1/editor_cache_uploads?id=eq.<row-id>" \
+  -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY"
+```
+
+Keep downloaded copies without the `user_id` (model + firmware are enough); a redacted file is device data.
+
+**Function secrets:** `editor-caches`: `EDITOR_CACHE_IP_SALT` (required, ≥ 32 characters; rotating it resets the
+per-network counters), `EDITOR_CACHE_UPLOADS=off` (kill switch), `EDITOR_CACHE_ALLOW_ANONYMOUS=0` (no new
+anonymous uploads; listing and deleting stay open), `EDITOR_CACHE_IP_HEADERS` (client-address headers, see above).
+`gc-blobs`: `ANONYMOUS_USER_IDLE_DAYS` (default 30, `off` disables the anonymous-user cleanup).
+
+**Tests:** `deno test supabase/functions/editor-caches/` (validator against synthetic caches, request parsing,
+network key, handler flow against in-memory fakes; no stack needed) and, on a local stack,
+`npx --yes supabase@latest test db` (`editor_cache_uploads.test.sql`, `anonymous_sessions.test.sql`).
+
+### Anonymous sessions (project-wide)
+Enabling anonymous sign-ins gives every caller who asks a valid `authenticated` JWT (with `is_anonymous: true`),
+rate-limited by Supabase Auth per IP (`[auth.rate_limit] anonymous_users`, 30/h). Everything written for
+"signed-in users" would otherwise admit them, so the account-only features refuse anonymous sessions explicitly:
+- cloud sync tables `documents`, `preset_versions`, `backups`, the `preset-blobs` bucket and the Remote relay
+  channel — restrictive RLS policies (`…_anonymous_session_hardening.sql`);
+- `device-profiles` publishing (`403 account-required`) and `diagnostic-captures` (already refused).
+`delete-account` accepts anonymous sessions on purpose (self-erasure).
+
+**What Supabase Auth itself stores for an anonymous user, and how long.** Like for any user, Auth (GoTrue) keeps
+a row in `auth.users` (`is_anonymous = true`), its sessions in `auth.sessions` — **including the client's IP
+address and user agent** — and entries in its audit log `auth.audit_log_entries` (which also record an IP
+address). These live outside this project's schema. To bound them:
+- **Anonymous users are deleted** by `gc-blobs` (Auth admin API) once they own nothing in the upload stores and
+  have not signed in for `ANONYMOUS_USER_IDLE_DAYS` (default **30**; `off` disables). That removes the user row and
+  its sessions with it. Accounts — including anonymous users who later linked an e-mail — are never touched. A
+  deleted anonymous install simply signs in anonymously again (new id) the next time it needs one.
+- **The audit log is not removed by deleting a user**, and nothing in this repo purges it: its entries (with IP
+  address) stay until the project's audit-log settings or the maintainer remove them. Either turn off storing the
+  Auth audit log in the database where the hosted project offers that option, or schedule a purge in the SQL
+  editor (placeholder interval; review it before use — the `auth` schema is managed by Supabase, and if the
+  `postgres` role may not delete there, use the dashboard option instead):
+  `select cron.schedule('auth-audit-purge', '41 3 * * *', $$delete from auth.audit_log_entries where created_at < now() - interval '30 days'$$);`
+- The platform's request logs (API gateway, edge functions) are kept on Supabase's side for the plan's log retention.
+The privacy text must name all three: Auth session/audit records (IP address, user agent), their retention
+(anonymous users ≤ 30 days idle after their last upload is gone; audit log as configured), and the platform logs.
+
 ## Gating (so it never ships dark)
 The entire sync layer is behind `AXIS_CLOUD=1`. With it unset, ForgeFX loads no cloud code and Axis
-shows no login — release builds do not set it.
+shows no login. **Release builds do set it**: the Axis release workflow writes `AXIS_CLOUD=1` and the project's
+Supabase URL + anon key into the bundled ForgeFX configuration, so every cloud feature (including diagnostic
+captures and editor-cache uploads) reaches released users once its client code ships.
 
 ## Self-host
 With the [Supabase CLI](https://supabase.com/docs/guides/local-development):
@@ -237,7 +442,9 @@ want email confirmations.
 - [x] Axis login + per-scope sync toggles + cloud preset viewer / version restore
 - [x] Global device-definition profile store (`device_profiles` + `device-profiles` edge fn)
 - [x] Opt-in diagnostic capture upload (`diagnostic_captures` + private bucket + `diagnostic-captures` edge fn, signed-upload flow)
-- [ ] Schedule `gc-blobs` daily (deploy gate for the diagnostic upload — see "Diagnostic captures")
+- [x] Opt-in editor-cache contributions (`editor_cache_*` + private bucket + `editor-caches` edge fn; accounts and anonymous sessions)
+- [ ] Schedule `gc-blobs` daily (deploy gate for both uploads — see "Diagnostic captures")
+- [ ] Hosted project: `EDITOR_CACHE_IP_SALT` secret (≥ 32 chars), anonymous sign-ins on (after the migrations), client-address header pinned after a staging check, covered firmwares marked, Auth audit-log retention decided
 - [ ] Patreon account link → `subscriptions` (hosted supporter tier)
 
 ## License

@@ -3,7 +3,8 @@
 -- use, so the schema works on Supabase projects created with the secure defaults (no implicit grants).
 --
 -- Positive checks (a needed privilege exists) hold on every stack. Negative checks are limited to what is
--- denied on EVERY stack once all migrations are applied: the diagnostic_captures revoke, the hardened quota
+-- denied on EVERY stack once all migrations are applied: the diagnostic_captures and editor_cache_* revokes
+-- (20261123120000_editor_cache_uploads.sql grants its tables to service_role only), the hardened quota
 -- functions, nothing for PUBLIC, device_profiles.created_by (the migration revokes the table-level SELECT
 -- from anon/authenticated and grants only the other columns, so uploader ids are unreadable on old and new
 -- stacks alike), and RLS-gated writes that fail with 42501 whether the privilege is missing (new default)
@@ -17,7 +18,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 
-select plan(87);
+select plan(103);
 
 insert into auth.users (id, email) values
   ('11111111-1111-4111-8111-111111111111', 'grants-a@example.test');
@@ -36,7 +37,7 @@ select is(has_function_privilege('anon', 'public.preset_quota()', 'execute'), fa
 select is(has_function_privilege('anon', 'public.enforce_preset_quota()', 'execute'), false, 'anon cannot execute the trigger-only enforce_preset_quota');
 select is(has_function_privilege('authenticated', 'public.enforce_preset_quota()', 'execute'), false, 'authenticated cannot execute the trigger-only enforce_preset_quota');
 
--- ── tables: the granted privileges (32; device_profiles for anon/authenticated is column-level, below) ──
+-- ── tables: the granted privileges (40; device_profiles for anon/authenticated is column-level, below) ──
 select ok(
   has_table_privilege(g.grantee::name, 'public.' || g.tbl, g.priv),
   g.grantee || ' has ' || upper(g.priv) || ' on ' || g.tbl)
@@ -75,8 +76,28 @@ from (values
   ('service_role',  'device_profiles',   'insert'),
   ('service_role',  'diagnostic_captures', 'select'),
   ('service_role',  'diagnostic_captures', 'update'),
-  ('service_role',  'diagnostic_captures', 'delete')
+  ('service_role',  'diagnostic_captures', 'delete'),
+  -- editor-caches function + gc-blobs + delete-account + maintainer (rows are created by the definer functions)
+  ('service_role',  'editor_cache_uploads',  'select'),
+  ('service_role',  'editor_cache_uploads',  'update'),
+  ('service_role',  'editor_cache_uploads',  'delete'),
+  ('service_role',  'editor_cache_coverage', 'select'),
+  ('service_role',  'editor_cache_coverage', 'insert'),
+  ('service_role',  'editor_cache_coverage', 'update'),
+  ('service_role',  'editor_cache_ip_usage', 'select'),
+  ('service_role',  'editor_cache_ip_usage', 'delete')
 ) as g(grantee, tbl, priv);
+
+-- ── the editor-cache tables stay closed to clients (6) ──
+select is(
+  (select array_agg(p order by p) from unnest(array['select','insert','update','delete','truncate','references','trigger']) as p
+    where has_table_privilege(g.r::name, g.t, p)),
+  null::text[], g.r || ' has no privilege on ' || g.t)
+from (values
+  ('anon', 'public.editor_cache_uploads'), ('authenticated', 'public.editor_cache_uploads'),
+  ('anon', 'public.editor_cache_coverage'), ('authenticated', 'public.editor_cache_coverage'),
+  ('anon', 'public.editor_cache_ip_usage'), ('authenticated', 'public.editor_cache_ip_usage')
+) as g(r, t);
 
 -- ── diagnostic_captures stays closed to clients (2) ──
 select is(
@@ -184,7 +205,7 @@ select throws_ok(
   '42501', null, 'anon cannot write device_profiles');
 reset role;
 
--- ── service_role: the edge-function and maintainer flows work (15) ──
+-- ── service_role: the edge-function and maintainer flows work (17) ──
 set local role service_role;
 
 -- subscriptions: written by the service role (Patreon link / maintainer), read by is_paid
@@ -212,6 +233,13 @@ select lives_ok(
   'service_role can finalize a diagnostic capture');
 select is((select count(*)::integer from public.diagnostic_captures where user_id = '11111111-1111-4111-8111-111111111111'), 1, 'service_role can read diagnostic_captures');
 select lives_ok($$delete from public.diagnostic_captures where user_id = '11111111-1111-4111-8111-111111111111'$$, 'service_role can delete diagnostic_captures');
+
+-- editor-caches function: reserve (rpc) and read back (complete/delete are covered by editor_cache_uploads.test.sql)
+select lives_ok(
+  $$select * from public.reserve_editor_cache_upload('11111111-1111-4111-8111-111111111111', repeat('e', 64), 17, '13.0', '13.0', null,
+      'effectDefinitions_11_13p0.cache', repeat('b', 64), 1000, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now(), 1)$$,
+  'service_role can reserve an editor-cache upload');
+select is((select count(*)::integer from public.editor_cache_uploads where user_id = '11111111-1111-4111-8111-111111111111'), 1, 'service_role can read editor_cache_uploads');
 
 -- gc-blobs reads every referenced blob path; delete-account erases the user's rows
 select lives_ok('select blob_path from public.preset_versions', 'service_role can read preset_versions (gc-blobs)');
