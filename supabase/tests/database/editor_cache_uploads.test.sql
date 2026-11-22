@@ -262,24 +262,25 @@ select lives_ok($$select * from pg_temp.res('dddddddd-dddd-4ddd-8ddd-ddddddddddd
   'completing the small upload frees its charge');
 
 -- ── network rate limit: fresh uploader ids do not help; counters outlive deleted uploads (4) ──
+-- (13.0 is covered again after the reopen section above, so the limit tests use firmwares of their own.)
 select lives_ok(
-  $$select pg_temp.res(pg_temp.n(g), pg_temp.sha(100 + g), p_ip => pg_temp.ipk(1)) from generate_series(1, 5) g$$,
+  $$select pg_temp.res(pg_temp.n(g), pg_temp.sha(100 + g), p_ip => pg_temp.ipk(1), p_fw => '60.0', p_file => '60.0') from generate_series(1, 5) g$$,
   'five uploaders on one network are admitted');
-select throws_ok($$select * from pg_temp.res(pg_temp.n(6), pg_temp.sha(106), p_ip => pg_temp.ipk(1))$$,
+select throws_ok($$select * from pg_temp.res(pg_temp.n(6), pg_temp.sha(106), p_ip => pg_temp.ipk(1), p_fw => '60.0', p_file => '60.0')$$,
   'XQ005', 'editor_cache_network_rate_limited', 'a sixth uploader on the same network is refused');
 delete from public.editor_cache_uploads where user_id = pg_temp.n(1);
 select is((select count(*)::integer from public.editor_cache_ip_usage where ip_key = pg_temp.ipk(1) and upload_id is null), 1,
   'deleting an upload unlinks its counter but keeps it');
-select throws_ok($$select * from pg_temp.res(pg_temp.n(6), pg_temp.sha(106), p_ip => pg_temp.ipk(1))$$,
+select throws_ok($$select * from pg_temp.res(pg_temp.n(6), pg_temp.sha(106), p_ip => pg_temp.ipk(1), p_fw => '60.0', p_file => '60.0')$$,
   'XQ005', 'editor_cache_network_rate_limited', 'so delete-and-retry does not reset the network limit');
 
 -- ── network byte quota (3) ──
-select lives_ok($$select * from pg_temp.res(pg_temp.n(7), pg_temp.sha(107), p_ip => pg_temp.ipk(2), p_ip_quota => 4194804)$$,
+select lives_ok($$select * from pg_temp.res(pg_temp.n(7), pg_temp.sha(107), p_ip => pg_temp.ipk(2), p_fw => '61.0', p_file => '61.0', p_ip_quota => 4194804)$$,
   'a reservation under the network quota is admitted');
-select throws_ok($$select * from pg_temp.res(pg_temp.n(8), pg_temp.sha(108), p_ip => pg_temp.ipk(2), p_ip_quota => 4194804)$$,
+select throws_ok($$select * from pg_temp.res(pg_temp.n(8), pg_temp.sha(108), p_ip => pg_temp.ipk(2), p_fw => '61.0', p_file => '61.0', p_ip_quota => 4194804)$$,
   'XQ006', 'editor_cache_network_quota_exceeded', 'another uploader on that network exceeds it (pending counts at the cap)');
 delete from public.editor_cache_uploads where user_id = pg_temp.n(7);
-select lives_ok($$select * from pg_temp.res(pg_temp.n(8), pg_temp.sha(108), p_ip => pg_temp.ipk(2), p_ip_quota => 4194804)$$,
+select lives_ok($$select * from pg_temp.res(pg_temp.n(8), pg_temp.sha(108), p_ip => pg_temp.ipk(2), p_fw => '61.0', p_file => '61.0', p_ip_quota => 4194804)$$,
   'a pending upload deleted before it completed no longer counts');
 
 -- ── argument checks (2) ──
