@@ -3,12 +3,13 @@
 -- use, so the schema works on Supabase projects created with the secure defaults (no implicit grants).
 --
 -- Positive checks (a needed privilege exists) hold on every stack. Negative checks are limited to what is
--- denied on EVERY stack once all migrations are applied: the diagnostic_captures and editor_cache_* revokes
--- (20261123120000_editor_cache_uploads.sql grants its tables to service_role only), the hardened quota
--- functions, nothing for PUBLIC, device_profiles.created_by (the migration revokes the table-level SELECT
--- from anon/authenticated and grants only the other columns, so uploader ids are unreadable on old and new
--- stacks alike), and RLS-gated writes that fail with 42501 whether the privilege is missing (new default)
--- or RLS rejects the row (older, broader implicit grants).
+-- denied on EVERY stack once all migrations are applied: the diagnostic_captures, editor_cache_* and
+-- definition_source_* revokes (20261123120000_editor_cache_uploads.sql and 20261201120000_definition_sources.sql
+-- grant their private tables to service_role only), the hardened quota functions, nothing for PUBLIC,
+-- device_profiles.created_by (the migration revokes the table-level SELECT from anon/authenticated and grants
+-- only the other columns, so uploader ids are unreadable on old and new stacks alike), definition_sources
+-- (column-level SELECT only, revoked at table level by its migration), and RLS-gated writes that fail with
+-- 42501 whether the privilege is missing (new default) or RLS rejects the row (older, broader implicit grants).
 --
 -- Run against a LOCAL stack only (it needs the migrations applied and creates throw-away rows inside a
 -- transaction that is rolled back):
@@ -18,7 +19,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 
-select plan(103);
+select plan(141);
 
 insert into auth.users (id, email) values
   ('11111111-1111-4111-8111-111111111111', 'grants-a@example.test');
@@ -26,6 +27,10 @@ insert into auth.users (id, email) values
 -- a shared, public device profile to read as anon / authenticated (inserted as the table owner)
 insert into public.device_profiles (model, firmware, content_hash, profile, source)
   values (17, '12.0', 'grants-test-1', '{}'::jsonb, 'live-walk');
+-- a shared, public definition source (synthetic, inserted as the table owner; counted as contributed, since an
+-- orphan without contributions is hidden by the policy)
+insert into public.definition_sources (model, firmware, kind, raw_format, fact_hash, source, quality, bytes, contributors)
+  values (17, '12.0', 'editor-cache', 1, repeat('a', 64), '{"kind":"editor-cache","firmware":"12.0"}'::jsonb, 3, 10, 1);
 
 -- ── functions: who may execute what (8) ──
 select is(has_function_privilege('authenticated', 'public.is_paid(uuid)', 'execute'), true, 'authenticated can execute is_paid (called by preset_quota)');
@@ -37,7 +42,7 @@ select is(has_function_privilege('anon', 'public.preset_quota()', 'execute'), fa
 select is(has_function_privilege('anon', 'public.enforce_preset_quota()', 'execute'), false, 'anon cannot execute the trigger-only enforce_preset_quota');
 select is(has_function_privilege('authenticated', 'public.enforce_preset_quota()', 'execute'), false, 'authenticated cannot execute the trigger-only enforce_preset_quota');
 
--- ── tables: the granted privileges (40; device_profiles for anon/authenticated is column-level, below) ──
+-- ── tables: the granted privileges (54; device_profiles and definition_sources for anon/authenticated are column-level, below) ──
 select ok(
   has_table_privilege(g.grantee::name, 'public.' || g.tbl, g.priv),
   g.grantee || ' has ' || upper(g.priv) || ' on ' || g.tbl)
@@ -85,10 +90,26 @@ from (values
   ('service_role',  'editor_cache_coverage', 'insert'),
   ('service_role',  'editor_cache_coverage', 'update'),
   ('service_role',  'editor_cache_ip_usage', 'select'),
-  ('service_role',  'editor_cache_ip_usage', 'delete')
+  ('service_role',  'editor_cache_ip_usage', 'delete'),
+  -- definition-sources function + gc-blobs + delete-account + maintainer (pins, deletes; writes go through the
+  -- definer functions, the grants keep the maintainer's direct SQL working)
+  ('service_role',  'definition_sources',              'select'),
+  ('service_role',  'definition_sources',              'insert'),
+  ('service_role',  'definition_sources',              'update'),
+  ('service_role',  'definition_sources',              'delete'),
+  ('service_role',  'definition_source_contributions', 'select'),
+  ('service_role',  'definition_source_contributions', 'insert'),
+  ('service_role',  'definition_source_contributions', 'update'),
+  ('service_role',  'definition_source_contributions', 'delete'),
+  ('service_role',  'definition_source_reports',       'select'),
+  ('service_role',  'definition_source_reports',       'insert'),
+  ('service_role',  'definition_source_reports',       'update'),
+  ('service_role',  'definition_source_reports',       'delete'),
+  ('service_role',  'definition_source_network_usage', 'select'),
+  ('service_role',  'definition_source_network_usage', 'delete')
 ) as g(grantee, tbl, priv);
 
--- ── the editor-cache tables stay closed to clients (6) ──
+-- ── the editor-cache and private definition-source tables stay closed to clients (12) ──
 select is(
   (select array_agg(p order by p) from unnest(array['select','insert','update','delete','truncate','references','trigger']) as p
     where has_table_privilege(g.r::name, g.t, p)),
@@ -96,7 +117,10 @@ select is(
 from (values
   ('anon', 'public.editor_cache_uploads'), ('authenticated', 'public.editor_cache_uploads'),
   ('anon', 'public.editor_cache_coverage'), ('authenticated', 'public.editor_cache_coverage'),
-  ('anon', 'public.editor_cache_ip_usage'), ('authenticated', 'public.editor_cache_ip_usage')
+  ('anon', 'public.editor_cache_ip_usage'), ('authenticated', 'public.editor_cache_ip_usage'),
+  ('anon', 'public.definition_source_contributions'), ('authenticated', 'public.definition_source_contributions'),
+  ('anon', 'public.definition_source_reports'), ('authenticated', 'public.definition_source_reports'),
+  ('anon', 'public.definition_source_network_usage'), ('authenticated', 'public.definition_source_network_usage')
 ) as g(r, t);
 
 -- ── diagnostic_captures stays closed to clients (2) ──
@@ -124,13 +148,55 @@ select is(
   true, 'authenticated can select every public device_profiles column');
 select is(has_column_privilege('authenticated', 'public.device_profiles', 'created_by', 'select'), false, 'authenticated cannot select device_profiles.created_by');
 
+-- ── definition_sources: every public column readable by anon/authenticated, but only per column (4) ──
+-- Column-level like device_profiles, so a column added later stays private until it is granted (the precise
+-- first_seen / last_confirmed_at are not granted: definition_sources.test.sql checks that).
+select is(
+  (select bool_and(has_column_privilege(g.r::name, 'public.definition_sources', c, 'select'))
+     from unnest(array['id', 'model', 'firmware', 'kind', 'raw_format', 'fact_hash', 'source', 'summary', 'quality',
+                       'coverage_score', 'bytes', 'tier', 'pinned', 'contributors', 'networks', 'spot_passes',
+                       'spot_failures', 'quarantined', 'first_seen_day', 'last_confirmed_day']) as c),
+  true, g.r || ' can select every definition_sources column')
+from (values ('anon'), ('authenticated')) as g(r);
+select is(
+  (select array_agg(p order by p) from unnest(array['select','insert','update','delete','truncate','references','trigger']) as p
+    where has_table_privilege(g.r::name, 'public.definition_sources', p)),
+  null::text[], g.r || ' has no table-level privilege on definition_sources')
+from (values ('anon'), ('authenticated')) as g(r);
+
+-- ── definition-source functions: service_role only; the internal helpers nobody (2) ──
+select is(
+  (select array_agg(f order by f) from unnest(array[
+     'public.contribute_definition_source(uuid,text,integer,text,text,integer,text,jsonb,jsonb,integer,integer,integer,jsonb,timestamptz,integer,integer,integer,integer,bigint,integer,bigint)',
+     'public.withdraw_definition_contributions(uuid,uuid,integer,text)',
+     'public.report_definition_source(uuid,text,uuid,text,integer,integer,integer,jsonb,integer,integer,integer)',
+     'public.select_definition_sources(integer,text,integer)',
+     'public.cleanup_orphan_definition_sources()',
+     'public.unlink_expired_definition_contributions(timestamptz,interval,interval)']) as f
+    where not has_function_privilege('service_role', f, 'execute')),
+  null::text[], 'service_role can execute every definition-source function');
+select is(
+  (select array_agg(r || ':' || f order by r, f)
+     from unnest(array[
+     'public.contribute_definition_source(uuid,text,integer,text,text,integer,text,jsonb,jsonb,integer,integer,integer,jsonb,timestamptz,integer,integer,integer,integer,bigint,integer,bigint)',
+     'public.withdraw_definition_contributions(uuid,uuid,integer,text)',
+     'public.report_definition_source(uuid,text,uuid,text,integer,integer,integer,jsonb,integer,integer,integer)',
+     'public.select_definition_sources(integer,text,integer)',
+     'public.cleanup_orphan_definition_sources()',
+     'public.unlink_expired_definition_contributions(timestamptz,interval,interval)',
+     'public.definition_source_refresh(uuid)',
+     'public.definition_source_contribution_removed()']) as f
+     cross join unnest(array['public', 'anon', 'authenticated']) as r
+    where has_function_privilege(r::name, f, 'execute')),
+  null::text[], 'PUBLIC, anon and authenticated cannot execute any definition-source function');
+
 -- ── nothing for PUBLIC (4) ──
 select is(has_table_privilege('public', 'public.documents', 'select'), false, 'PUBLIC has no SELECT on documents');
 select is(has_function_privilege('public', 'public.is_paid(uuid)', 'execute'), false, 'PUBLIC cannot execute is_paid');
 select is(has_function_privilege('public', 'public.preset_quota()', 'execute'), false, 'PUBLIC cannot execute preset_quota');
 select is(has_function_privilege('public', 'public.enforce_preset_quota()', 'execute'), false, 'PUBLIC cannot execute enforce_preset_quota');
 
--- ── authenticated: the sync flows work through RLS (19) ──
+-- ── authenticated: the sync flows work through RLS (21) ──
 set local role authenticated;
 set local request.jwt.claims = '{"sub":"11111111-1111-4111-8111-111111111111","role":"authenticated"}';
 set local request.jwt.claim.sub = '11111111-1111-4111-8111-111111111111';
@@ -176,6 +242,13 @@ select is(
        from public.device_profiles where content_hash = 'grants-test-1') s),
   1, 'authenticated can read the public device_profiles columns');
 select throws_ok('select created_by from public.device_profiles', '42501', null, 'authenticated cannot read device_profiles.created_by');
+select is(
+  (select count(*)::integer from (
+     select id, model, firmware, kind, raw_format, fact_hash, source, summary, quality, coverage_score, bytes, tier, pinned,
+            contributors, networks, spot_passes, spot_failures, quarantined, first_seen_day, last_confirmed_day
+       from public.definition_sources where fact_hash = repeat('a', 64)) s),
+  1, 'authenticated can read the public definition_sources columns');
+select throws_ok('select user_id from public.definition_source_contributions', '42501', null, 'authenticated cannot read definition_source_contributions');
 
 select throws_ok(
   $$insert into public.subscriptions (user_id, active) values ('11111111-1111-4111-8111-111111111111', true)$$,
@@ -189,7 +262,7 @@ select throws_ok(
   '42501', null, 'authenticated cannot write device_profiles');
 reset role;
 
--- ── anon: public device-profile read only, without created_by (3) ──
+-- ── anon: public device-profile and definition-source reads only, without created_by (5) ──
 set local role anon;
 set local request.jwt.claims = '{"role":"anon"}';
 set local request.jwt.claim.sub = '';
@@ -203,9 +276,16 @@ select throws_ok(
   $$insert into public.device_profiles (model, firmware, content_hash, profile, source)
     values (17, '12.0', 'grants-test-y', '{}'::jsonb, 'live-walk')$$,
   '42501', null, 'anon cannot write device_profiles');
+select is(
+  (select count(*)::integer from (
+     select id, model, firmware, kind, raw_format, fact_hash, source, summary, quality, coverage_score, bytes, tier, pinned,
+            contributors, networks, spot_passes, spot_failures, quarantined, first_seen_day, last_confirmed_day
+       from public.definition_sources where fact_hash = repeat('a', 64)) s),
+  1, 'anon can read the public definition_sources columns');
+select throws_ok('select network_key from public.definition_source_reports', '42501', null, 'anon cannot read definition_source_reports');
 reset role;
 
--- ── service_role: the edge-function and maintainer flows work (17) ──
+-- ── service_role: the edge-function and maintainer flows work (25) ──
 set local role service_role;
 
 -- subscriptions: written by the service role (Patreon link / maintainer), read by is_paid
@@ -240,6 +320,25 @@ select lives_ok(
       'effectDefinitions_11_13p0.cache', repeat('b', 64), 1000, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now(), 1)$$,
   'service_role can reserve an editor-cache upload');
 select is((select count(*)::integer from public.editor_cache_uploads where user_id = '11111111-1111-4111-8111-111111111111'), 1, 'service_role can read editor_cache_uploads');
+
+-- definition-sources function (contribute, list, report, withdraw), maintainer pin, gc-blobs sweeps
+select lives_ok(
+  $$select * from public.contribute_definition_source('11111111-1111-4111-8111-111111111111', repeat('f', 64), 17, '13.0', 'editor-cache', 1,
+      repeat('d', 64), '{"kind":"editor-cache","firmware":"13.0"}'::jsonb, '{}'::jsonb, 3, 1, 10, '{}'::jsonb, now(), 1)$$,
+  'service_role can contribute a definition source');
+select is((select count(*)::integer from public.definition_source_contributions where user_id = '11111111-1111-4111-8111-111111111111'), 1,
+  'service_role can read definition_source_contributions');
+select is((select count(*)::integer from public.select_definition_sources(17, '13.0', 1)), 1, 'service_role can list the best definition sources');
+select lives_ok(
+  $$select * from public.report_definition_source('11111111-1111-4111-8111-111111111111', repeat('f', 64),
+      (select id from public.definition_sources where fact_hash = repeat('d', 64)), 'passed', 24, 24, 0, '{}'::jsonb)$$,
+  'service_role can report a spot check');
+select lives_ok($$update public.definition_sources set tier = 'official', pinned = true where fact_hash = repeat('d', 64)$$,
+  'service_role (maintainer) can pin a definition source');
+select is((select withdrawn from public.withdraw_definition_contributions('11111111-1111-4111-8111-111111111111')), 1,
+  'service_role can withdraw contributions');
+select lives_ok('select public.cleanup_orphan_definition_sources()', 'service_role can run the orphan cleanup');
+select lives_ok('select * from public.unlink_expired_definition_contributions()', 'service_role can run the unlink sweep');
 
 -- gc-blobs reads every referenced blob path; delete-account erases the user's rows
 select lives_ok('select blob_path from public.preset_versions', 'service_role can read preset_versions (gc-blobs)');
