@@ -56,6 +56,11 @@ supabase/
   `unlink_expired_…` (`XQ001`/`XQ002` uploader, `XQ005`/`XQ006` network, `XQ007` rejected facts).
 - `…_definition_sources_orphan_reset.sql` — `contribute_definition_source` deletes an unpinned source without
   contributions (under the source-key lock) before sharing identical facts, so an orphan is never revived.
+- `…_device_profiles_ranking.sql` — v1 `device_profiles` ranking key: `row_count` = (family, parameter id) entries of
+  `profile->'ranges'`, a STORED GENERATED column (database-computed, backfills existing rows, nobody can set it) via
+  `device_profile_row_count(jsonb)` (immutable, EXECUTE for service_role only: a generated column's function runs with
+  the inserting role's privileges); index `(model, firmware, source, row_count desc nulls last, created_at)`; column
+  granted to anon/authenticated for SELECT only.
 
 **Edge functions** (`supabase/functions/*/index.ts`, Deno + `supabase-js`):
 - `delete-account` — GDPR erase. `verify_jwt = true`; identifies the caller from their
@@ -63,9 +68,12 @@ supabase/
 - `gc-blobs` — orphan-blob sweep. `verify_jwt = false`, gated by the `GC_SECRET` header;
   deletes `preset-blobs` objects not referenced by any `preset_versions.blob_path`,
   skipping objects <24 h old. `?dry=1` reports without deleting.
-- `device-profiles` — shared profile store. `verify_jwt = false` (GET is public); POST
+- `device-profiles` — shared profile store (v1). `verify_jwt = false` (GET is public); POST
   verifies the JWT manually (anonymous sessions refused), validates + size-caps the body, computes
-  the content hash server-side, rate-limits, and inserts with the service role.
+  the content hash server-side, rate-limits, and inserts with the service role. Logic in `handler.ts` behind a
+  `Deps` seam (`handler.test.ts`). GET serves the BEST row, never the newest: `source` editor-cache first, then
+  `row_count` desc, then `created_at` asc (`PROFILE_ORDER`; the response shape is the v1 one). Deploy the ranking
+  migration BEFORE the function (GET orders by `row_count`).
 - `diagnostic-captures` — opt-in diagnostic upload, signed-upload flow (reserve → client uploads
   to storage → finalize checks size + gzip magic). `verify_jwt = false`, handler authenticates;
   anonymous sessions refused. Logic in `handler.ts`/`validate.ts` behind a `Deps` seam.
@@ -121,7 +129,7 @@ No local CLI, Deno, or Docker is assumed — invoke the CLI through `npx`:
 
 **There is no automated test gate (no CI) in this repo yet.** What exists: Deno unit tests
 that need no stack — `deno test supabase/functions/` (editor-caches, diagnostic-captures, definition-sources,
-_shared; Deno is not assumed installed: `npx --yes deno@2 test supabase/functions/` works) — and pgTAP suites under
+device-profiles, _shared; Deno is not assumed installed: `npx --yes deno@2 test supabase/functions/` works) — and pgTAP suites under
 `supabase/tests/database/` that need the Docker-gated local stack (`… test db`). Do not claim a
 passing gate that does not exist. (Follow-up tracked in Plane.)
 
