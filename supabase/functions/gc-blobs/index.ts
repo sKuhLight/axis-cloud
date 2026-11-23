@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
+import { ownersAmong } from "./owners.ts";
 
 // Orphan-blob sweep. Quota enforcement is metadata-gated (a preset_versions BEFORE INSERT trigger),
 // so an interrupted or rejected sync can leave a blob in Storage with no metadata row referencing
@@ -17,9 +18,15 @@ import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 // keyed hashes, no user id) are deleted once unlinked from an upload and older than the longest limit window
 // (30 days), reported under `editorCacheNetworkCounters`.
 //
-// And it deletes Supabase ANONYMOUS auth users (editor-cache uploaders without an account) that have nothing left
-// in the upload stores and no sign-in for ANONYMOUS_USER_IDLE_DAYS (default 30; `off` disables), via the Auth
-// admin API, reported under `anonymousUsers`. Supabase Auth keeps the client IP of every session it issues
+// Shared device definitions (cloud v2, `definition_sources` + private contributions/reports/network counters):
+// `unlink_expired_definition_contributions()` unlinks contributions older than their 180-day link (user id and
+// network key nulled; the public content and its counts stay), deletes spot-check reports older than 180 days and
+// network counters older than 30 days; `cleanup_orphan_definition_sources()` deletes sources left without any
+// contribution (unless the maintainer pinned them). Reported under `definitionSources`.
+//
+// And it deletes Supabase ANONYMOUS auth users (editor-cache uploaders and definition sharers without an account)
+// that own nothing in the upload stores — no upload, no LINKED definition contribution — and have not signed in for
+// ANONYMOUS_USER_IDLE_DAYS (default 30; `off` disables), via the Auth admin API, reported under `anonymousUsers`. Supabase Auth keeps the client IP of every session it issues
 // (sessions are deleted with the user); this bounds how long such records linger for a contribution that is
 // already gone. Auth's own audit log is NOT removed by this (see README "Anonymous sessions").
 //
@@ -33,6 +40,9 @@ const MAX_PER_RUN = 5000;
 /** Editor-cache network counters are only needed for the longest limit window (the 30-day byte quota) once
  *  their upload is gone; while it exists they are kept (coverage counts each network once). */
 const NETWORK_COUNTER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/** Retention of definition-source spot-check reports and network counters (= the SQL function's defaults). */
+const DEFINITION_REPORT_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
+const DEFINITION_USAGE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 /** Anonymous auth users idle this many days with no remaining uploads are deleted (env ANONYMOUS_USER_IDLE_DAYS). */
 const DEFAULT_ANONYMOUS_USER_IDLE_DAYS = 30;
 /** Auth admin listUsers pages per run (1000 users each); the rest is handled by the next run. */
@@ -229,6 +239,80 @@ async function pruneNetworkCounters(admin: Admin, dry: boolean): Promise<Counter
   return res;
 }
 
+interface DefinitionSourcesSweep {
+  /** Linked contributions past their 180-day link (dry run: would be unlinked). */
+  expiredLinks: number;
+  unlinked: number;
+  /** Spot-check reports older than 180 days. */
+  expiredReports: number;
+  reportsDeleted: number;
+  /** Per-network counters older than 30 days. */
+  expiredUsage: number;
+  usageDeleted: number;
+  /** Sources without any contribution and not pinned. */
+  orphans: number;
+  orphansDeleted: number;
+  error?: string;
+}
+
+/**
+ * Retention of the shared definitions store: counts what is due, then (unless dry) runs the two SQL functions —
+ * unlink first (it never creates orphans: an unlinked contribution still counts), then the orphan cleanup (sources
+ * whose last contribution went with an account deletion the withdraw call did not cover). Runs BEFORE the
+ * anonymous-user cleanup, so an anonymous sharer whose links just expired owns nothing any more and is deleted in
+ * the same run. Never throws.
+ */
+async function sweepDefinitionSources(admin: Admin, dry: boolean): Promise<DefinitionSourcesSweep> {
+  const res: DefinitionSourcesSweep = {
+    expiredLinks: 0,
+    unlinked: 0,
+    expiredReports: 0,
+    reportsDeleted: 0,
+    expiredUsage: 0,
+    usageDeleted: 0,
+    orphans: 0,
+    orphansDeleted: 0
+  };
+  try {
+    const now = Date.now();
+    const count = async (q: PromiseLike<{ count: number | null; error: unknown }>): Promise<number> => {
+      const { count: n, error } = await q;
+      if (error) throw error;
+      return n ?? 0;
+    };
+    res.expiredLinks = await count(
+      admin.from("definition_source_contributions").select("id", { count: "exact", head: true })
+        .not("user_id", "is", null).lt("linked_until", new Date(now).toISOString())
+    );
+    res.expiredReports = await count(
+      admin.from("definition_source_reports").select("id", { count: "exact", head: true })
+        .lt("created_at", new Date(now - DEFINITION_REPORT_MAX_AGE_MS).toISOString())
+    );
+    res.expiredUsage = await count(
+      admin.from("definition_source_network_usage").select("id", { count: "exact", head: true })
+        .lt("created_at", new Date(now - DEFINITION_USAGE_MAX_AGE_MS).toISOString())
+    );
+    // contributors is recomputed on every removal of a contribution, so 0 = no contribution left.
+    res.orphans = await count(
+      admin.from("definition_sources").select("id", { count: "exact", head: true }).eq("contributors", 0).eq("pinned", false)
+    );
+    if (!dry) {
+      const { data, error } = await admin.rpc("unlink_expired_definition_contributions");
+      if (error) throw error;
+      const row = (Array.isArray(data) ? data[0] : data) as { unlinked?: number; reports_deleted?: number; usage_deleted?: number } | undefined;
+      res.unlinked = row?.unlinked ?? 0;
+      res.reportsDeleted = row?.reports_deleted ?? 0;
+      res.usageDeleted = row?.usage_deleted ?? 0;
+      const { data: n, error: cerr } = await admin.rpc("cleanup_orphan_definition_sources");
+      if (cerr) throw cerr;
+      res.orphansDeleted = typeof n === "number" ? n : Number(n ?? 0);
+    }
+  } catch (e) {
+    res.error = e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e);
+  }
+  return res;
+}
+
 interface AnonymousUserCleanup {
   /** The idle threshold in days; null = disabled (ANONYMOUS_USER_IDLE_DAYS=off). */
   idleDays: number | null;
@@ -244,24 +328,24 @@ function lastActivityMs(u: { last_sign_in_at?: string | null; created_at?: strin
   return t.length ? Math.max(...t) : Date.now(); // unknown activity: treat as active (never delete blindly)
 }
 
-/** Ids among `ids` that still own a row in one of the upload stores. */
+/** Ids among `ids` that still own something: a row in one of the upload stores, or a LINKED definition
+ *  contribution (an unlinked one has no user id). A linked one must survive: deleting the auth user would cascade
+ *  it away, and with it the uploader's vote and possibly the public row. */
 async function idsWithUploads(admin: Admin, ids: string[]): Promise<Set<string>> {
-  const owning = new Set<string>();
-  for (let i = 0; i < ids.length; i += 100) {
-    const chunk = ids.slice(i, i + 100);
-    for (const table of [EDITOR_CACHES.table, DIAGNOSTICS.table]) {
-      const { data, error } = await admin.from(table).select("user_id").in("user_id", chunk);
-      if (error) throw error;
-      for (const r of data ?? []) owning.add(r.user_id as string);
-    }
-  }
-  return owning;
+  // Answers are capped at the Data API's max-rows without an error: ownersAmong() asks for the exact count too and
+  // re-asks for the users a truncated answer did not settle (owners.ts), failing closed when it cannot tell.
+  return await ownersAmong(ids, [EDITOR_CACHES.table, DIAGNOSTICS.table, "definition_source_contributions"], async (table, chunk) => {
+    const { data, error, count } = await admin.from(table).select("user_id", { count: "exact" }).in("user_id", [...chunk]);
+    if (error) throw error;
+    return { userIds: (data ?? []).map((r) => r.user_id as string), count: count ?? null };
+  });
 }
 
 /**
- * Deletes anonymous auth users that are idle for ANONYMOUS_USER_IDLE_DAYS and own nothing in the upload stores.
- * Accounts (is_anonymous false — including former anonymous users who linked an e-mail) are never touched.
- * Runs AFTER the upload sweeps, so users whose uploads just expired qualify in the same run. Never throws.
+ * Deletes anonymous auth users that are idle for ANONYMOUS_USER_IDLE_DAYS and own nothing in the upload stores and
+ * no linked definition contribution. Accounts (is_anonymous false — including former anonymous users who linked an
+ * e-mail) are never touched. Runs AFTER the upload sweeps and the definition unlink, so users whose uploads just
+ * expired or whose links just ended qualify in the same run. Never throws.
  */
 async function cleanupAnonymousUsers(admin: Admin, dry: boolean): Promise<AnonymousUserCleanup> {
   const raw = (Deno.env.get("ANONYMOUS_USER_IDLE_DAYS") ?? "").trim().toLowerCase();
@@ -315,6 +399,7 @@ Deno.serve(async (req: Request) => {
   const diagnostics = await sweepPrivateUploads(admin, dry, DIAGNOSTICS);
   const editorCaches = await sweepPrivateUploads(admin, dry, EDITOR_CACHES);
   const editorCacheNetworkCounters = await pruneNetworkCounters(admin, dry);
+  const definitionSources = await sweepDefinitionSources(admin, dry);
   const anonymousUsers = await cleanupAnonymousUsers(admin, dry);
 
   // Every referenced blob path, across all users (service role bypasses RLS).
@@ -361,6 +446,7 @@ Deno.serve(async (req: Request) => {
       diagnostics,
       editorCaches,
       editorCacheNetworkCounters,
+      definitionSources,
       anonymousUsers
     }),
     { headers: { "Content-Type": "application/json" } }

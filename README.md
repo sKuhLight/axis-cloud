@@ -22,7 +22,10 @@ supabase/
     20261122120000_subscriptions_source_catchup.sql  # adds subscriptions.source where an older project lacks it (no-op elsewhere)
     20261123120000_editor_cache_uploads.sql  # editor-cache contributions: uploads, coverage, network counters, bucket, reserve/complete
     20261123130000_anonymous_session_hardening.sql  # keeps account-only features closed to anonymous sessions
-  functions/                  # Deno edge functions: delete-account, gc-blobs, device-profiles, diagnostic-captures, editor-caches
+    20261201120000_definition_sources.sql  # shared device definitions: public sources, private contributions/reports/counters, ranking
+    20261201121000_definition_sources_orphan_reset.sql  # an identical share of an orphaned source starts a fresh row
+  functions/                  # Deno edge functions: delete-account, gc-blobs, device-profiles, diagnostic-captures, editor-caches, definition-sources
+    _shared/                  # code shared by the functions (CORS headers, client network + keyed network marker); not deployed itself
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
 ```
 
@@ -72,6 +75,8 @@ files and never any preset content.**
 - **Key discipline (ForgeFX side):** profiles are keyed `<model-hex>_<major>p<minor>` (e.g. FM3 fw 12.0
   → `11_12p0`); this backend stores the `model` byte as an integer (`0x11` = 17) and `firmware` as a
   string (`"12.0"`).
+- **v2:** clients that know the shared device definitions store (see "Shared device definitions (cloud v2)") read
+  that first and fall back to this one; released clients keep using this store unchanged.
 
 ## Diagnostic captures (opt-in, maintainer-only)
 A signed-in user can upload the result of Axis's in-product **device diagnostic** (Settings → Debugging) so
@@ -391,14 +396,15 @@ rate-limited by Supabase Auth per IP (`[auth.rate_limit] anonymous_users`, 30/h)
 - cloud sync tables `documents`, `preset_versions`, `backups`, the `preset-blobs` bucket and the Remote relay
   channel — restrictive RLS policies (`…_anonymous_session_hardening.sql`);
 - `device-profiles` publishing (`403 account-required`) and `diagnostic-captures` (already refused).
-`delete-account` accepts anonymous sessions on purpose (self-erasure).
+`delete-account` accepts anonymous sessions on purpose (self-erasure). `editor-caches` and `definition-sources` accept
+them by design (each with a switch to refuse them: `EDITOR_CACHE_ALLOW_ANONYMOUS`, `DEFINITION_SOURCES_ALLOW_ANONYMOUS`).
 
 **What Supabase Auth itself stores for an anonymous user, and how long.** Like for any user, Auth (GoTrue) keeps
 a row in `auth.users` (`is_anonymous = true`), its sessions in `auth.sessions` — **including the client's IP
 address and user agent** — and entries in its audit log `auth.audit_log_entries` (which also record an IP
 address). These live outside this project's schema. To bound them:
-- **Anonymous users are deleted** by `gc-blobs` (Auth admin API) once they own nothing in the upload stores and
-  have not signed in for `ANONYMOUS_USER_IDLE_DAYS` (default **30**; `off` disables). That removes the user row and
+- **Anonymous users are deleted** by `gc-blobs` (Auth admin API) once they own nothing in the upload stores (and no
+  linked shared-definitions contribution) and have not signed in for `ANONYMOUS_USER_IDLE_DAYS` (default **30**; `off` disables). That removes the user row and
   its sessions with it. Accounts — including anonymous users who later linked an e-mail — are never touched. A
   deleted anonymous install simply signs in anonymously again (new id) the next time it needs one.
 - **The audit log is not removed by deleting a user**, and nothing in this repo purges it: its entries (with IP
@@ -410,6 +416,174 @@ address). These live outside this project's schema. To bound them:
 - The platform's request logs (API gateway, edge functions) are kept on Supabase's side for the plan's log retention.
 The privacy text must name all three: Auth session/audit records (IP address, user agent), their retention
 (anonymous users ≤ 30 days idle after their last upload is gone; audit log as configured), and the platform logs.
+
+## Shared device definitions (cloud v2)
+When Axis reads the definitions of a device (from the official editor's definitions cache, or by asking the device
+itself), the user can **share** them, so every other Axis on the same model and firmware gets them without an app
+update. It is a deliberate, explained step with an explicit consent — never automatic. Sharing works for a signed-in
+account **or** the install's anonymous session (see "Anonymous sessions"). Gen-3 devices only (Axe-Fx III `0x10`,
+FM3 `0x11`, FM9 `0x12`). This store replaces the v1 profile store for clients that know it; v1 stays for older ones.
+
+**What a row is.** One **raw definition source** — the records one read produced (parameter ids, typecodes, ranges,
+defaults, steps, model/type lists, factory cab names; for an editor-cache read also its section list, header triple
+and the count of omitted user tables; for a device read its scope and walk statistics) — keyed by
+`(model, firmware, kind, fact hash)`. `kind` is `editor-cache`, `live-full` or `live-readonly`. Never derived
+tables (every client derives its own), never presets, preset names, user cab names, parameter values, file paths or
+host names. Two honest reads of the same firmware produce the same **fact hash** and therefore the same row: the
+second one confirms the first instead of adding a copy.
+
+**Server-side, before anything is stored** (`supabase/functions/definition-sources/validate.ts`, `facts.ts`):
+- the source is checked field by field (types, bounds, records inside the declared sections / walked blocks, labels
+  at most 255 UTF-8 bytes without control characters, no prototype keys, finite numbers only, bounded sizes) and a
+  **sanitized copy** of the known fields only is kept — unknown keys are dropped, never stored;
+- **refused:** any record of a user name table (preset names, user cab banks: `422 contains-user-data`), a tolerant
+  parse (`422 tolerant-source`), a file whose name version differs from its header (`422 version-mismatch`), a source
+  of another firmware than the envelope's (`422 firmware-inconsistent`), anything below a **plausibility floor**
+  (editor cache: records in ≥ 16 sections and ≥ 500 distinct records; device read: records in ≥ 20 blocks and ≥ 300
+  distinct records: `422 implausible`). The floor, the coverage score and the summary count what a source SAYS —
+  distinct `(section, id)` positions and the sections/blocks that carry records — so repeating a record or listing
+  empty blocks in the scope buys nothing;
+- **stripped:** `id`, `origin`, the redacted file's `contentSha256` (a per-install fingerprint), the free-text
+  `walk.abortReason`; `capturedAt` is coarsened to the UTC day;
+- **computed, never taken from the client:** the fact hash, a summary (counts only, ≤ 2 KB), the quality and a
+  coverage score. The fact hash is sha256 over a canonical JSON of the source's facts, byte-identical to the
+  [forgefx-midi](https://github.com/sKuhLight/forgefx-midi) codec's `sourceFactHash` (pinned by the golden vectors
+  in `functions/definition-sources/fixtures/`, copied verbatim from the codec; a change needs a fact-hash version
+  bump on both sides). Raw format 1 only (`422 unsupported-raw-format` otherwise); `codecVersion` must be a version
+  stamp (`0.12.0-beta.1`).
+
+**Quality** (0–3, catalog-free): editor cache **3** = self-consistent file whose header version is the device
+firmware, **2** = the same file matched to another firmware. Device read **3** = no unresolved reply, no missing
+slot, no bound hit, extension not aborted; **2** = no unresolved reply but one of those; **1** = unresolved replies.
+A confirmation of a device read with a cleaner walk raises the row's quality.
+
+**Tiers and ranking** (SQL, `migrations/20261201120000_definition_sources.sql`): `official` and `rejected` are
+maintainer decisions (`pinned`); `verified` = quality 3 and at least **2 contributors on 2 networks** with the
+identical fact hash; everything else `candidate`. A `candidate` with failing spot-check reports from ≥ 3 networks
+and more failures than passes is **quarantined** (hidden, reversible). The listing serves the **best row per kind**
+— never compared across kinds — by tier, quality, coverage score, contributors, networks, then the **oldest**: a
+newer row only wins by being better, never by its date. Rejected, quarantined and orphaned rows are never served.
+Every client still checks a downloaded source against its own device (a read-only spot check) before using it; the
+tier only orders, it never exempts.
+
+**Public vs private.** `definition_sources` is public-read (column-level grant + RLS; dates only as UTC days, no
+user link). Who shared what (`definition_source_contributions`: auth user id, a keyed network marker, version stamps,
+consent time), the spot-check reports (`definition_source_reports`) and the per-network counters
+(`definition_source_network_usage`, no user id) are service-role only. No IP address is ever stored: the network is
+HMAC-SHA256'd under `DEFINITION_SOURCES_IP_SALT` — a secret of its own, so these markers cannot be matched with the
+editor-cache store's.
+
+**API** — `functions/v1/definition-sources` (`verify_jwt` off: the reads are public; the handler authenticates the
+rest itself; account or anonymous session as `Authorization: Bearer <access token>`):
+
+| Call | Auth | Request | Answer |
+|---|---|---|---|
+| `GET ?model=17&firmware=13.0&rawFormat=1` | none | (`rawFormat` = newest the client reads; default 1) | `200 { model, firmware, sources: SourceSummary[], alternatives: { 'editor-cache', 'live-full', 'live-readonly' } }`, `Cache-Control: public, max-age=300`; nothing yet → `sources: []` (never 404). `alternatives` counts the servable rows of a kind **including** the listed one |
+| `GET /source/<id>` | none | — | `200 { id, model, firmware, kind, rawFormat, factHash, tier, quality, summary, source }` (`source` = the sanitized raw source), `Cache-Control: public, max-age=86400`; `404 not-found` for a missing, rejected, quarantined or orphaned row |
+| `POST` (share) | Bearer | `{ model, firmware, kind, rawFormat, source, app?, consentAt, consentVersion }` | `201 { sourceId, factHash, created: true, deduped: false, confirmed: false, tier, contributors, networks }` · `200 { …, created: false, deduped: true, confirmed }` (the facts were in already; `confirmed` = this call added a contributor) |
+| `POST /withdraw` | Bearer | `{ sourceId }` or `{ all: true, model?, firmware? }` | `200 { withdrawn, deletedSources }` — own linked contributions only; an unknown or foreign `sourceId` → `404` |
+| `GET /mine` | Bearer | — | `200 { contributions: [{ id, sourceId, model, firmware, kind, factHash, createdAt, linkedUntil }] }` (≤ 100, `private, no-store`) |
+| `POST /report` | Bearer | `{ sourceId, verdict: 'passed'\|'failed', checked, answered, mismatches, app? }` | `200 { ok: true, quarantined }` |
+
+`SourceSummary` = `{ id, kind, rawFormat, factHash, tier, quality, contributors, networks, spotChecks: { passed, failed }, firstSeen, lastConfirmedAt, bytes, summary }`
+(`firstSeen` / `lastConfirmedAt` as `YYYY-MM-DD`). `consentAt` is an ISO time within ±24 h of the server,
+`consentVersion` ≥ 1 (the share consent text; any change of meaning bumps it); `firmware` is canonical
+(`13.0`, never `13.00`); `app` keeps version-like `forgefx` / `codec` / `axis` stamps only. A report needs an existing
+session (clients never create one for it) and a plausible outcome (`passed`: ≥ 12 targets checked, ≥ 90 % answered;
+`failed`: at least one answer); a report whose uploader or network contributed to the row is stored but not counted. `?action=withdraw|mine|report` works instead of the path.
+
+| Status | Body `error` | When |
+|---|---|---|
+| 400 | `invalid-request`, `invalid-json`, `empty-body`, `consent-required` | malformed request or envelope (incl. a non-canonical firmware, kind `live-probe`); consent fields missing, malformed or off by more than 24 h |
+| 401 | `unauthorized` | missing, malformed, invalid or expired token |
+| 403 | `account-required` | share/report by an anonymous session while `DEFINITION_SOURCES_ALLOW_ANONYMOUS=0` (withdraw and `/mine` stay open) |
+| 404 | `not-found` | unknown/unservable source; withdraw of a source you have no linked contribution to; report on a missing source |
+| 409 | `unsupported-model`, `rejected` | a model that does not contribute / facts the maintainer rejected |
+| 413 | `too-large` (`limit`, `bytes`) | share body (or its sanitized form) above 2 MiB; withdraw/report body above 8 KiB |
+| 422 | `invalid-source` (`path`, `reason`), `contains-user-data`, `tolerant-source`, `firmware-inconsistent`, `version-mismatch`, `implausible`, `unsupported-raw-format` | the source failed the server-side check (errors name a field path and a rule, never a value) |
+| 429 | `rate-limited`, `quota-exceeded` (+ `scope`: `uploader` or `network`) | see limits; `retryAfterSeconds` in the body, `Retry-After` header (CORS-exposed) |
+| 503 | `paused`, `auth-unavailable` | share/report: `DEFINITION_SOURCES` not `on`, or `DEFINITION_SOURCES_IP_SALT` missing / shorter than 32 characters / equal to `EDITOR_CACHE_IP_SALT`; reads: `DEFINITION_SOURCES=off` · the Auth server could not check the token (retry; `Retry-After`) |
+| 500 | `internal` | database failure (details only in the function log) |
+
+**Limits** (constants in `validate.ts`, enforced atomically in the SQL functions):
+
+| Limit | Value |
+|---|---|
+| Share request | 2 MiB (a raw editor-cache source is ~0.4 MB) |
+| New shares | 10 per hour — per uploader **and** per client network |
+| Volume | 40 MiB per 30 days — per uploader **and** per client network |
+| Reports | 30 per hour — per uploader **and** per client network |
+| One vote | per uploader and (model, firmware, kind): a new share of the same kind **replaces** the uploader's previous one |
+| `verified` | quality 3, 2 contributors on 2 networks |
+| Quarantine | `candidate` only; failures from ≥ 3 networks and more failures than passes |
+| Link / reports / network counters | 180 days / 180 days / 30 days |
+
+The network counters outlive withdrawals, so withdrawing and sharing again does not reset the per-network limits
+(the ones that bind someone minting anonymous ids). The client address is read like the editor-cache function does
+(`cf-connecting-ip`, `x-real-ip`, the **last** `x-forwarded-for` entry; the first write per worker logs which headers
+were present — names only); **pin** `DEFINITION_SOURCES_IP_HEADERS` after the same staging check.
+
+**Withdrawal, deletion and retention.**
+- `POST …/withdraw` removes the caller's contribution(s); counters and tier are recomputed, and a source left without
+  any contribution is **deleted** unless the maintainer pinned it.
+- `delete-account` first withdraws all of the caller's contributions (SQL function: ordered locks, orphans deleted
+  at once), deletes their reports, then the auth user (whose cascade covers anything left), then cleans up orphans.
+- **180 days after a share the link is removed** (`gc-blobs` → `unlink_expired_definition_contributions()`): user id
+  and network marker are nulled, the version stamps cleared, the consent time cut to the day. The definitions stay
+  published and keep counting; from then on the contribution can no longer be withdrawn individually (the consent
+  text says so). Reports are deleted after 180 days (the counters on the row are high-water marks and stay), network
+  counters after 30 days, orphaned sources by `cleanup_orphan_definition_sources()` (an identical share that meets an
+  orphan before the cleanup starts a fresh row; it never revives the old one). `gc-blobs` reports all of it
+  under `definitionSources` (`?dry=1`: counts only).
+- An anonymous user with a **linked** contribution is never deleted by the idle-user cleanup; once its links are
+  gone, it is deleted like any other idle anonymous user.
+
+**Maintainer (SQL editor; the dashboard runs it as the table owner):**
+
+```sql
+-- overview (precise times are server-side only)
+select id, model, firmware, kind, tier, pinned, quality, coverage_score, contributors, networks,
+       spot_passes, spot_failures, quarantined, bytes, first_seen, last_confirmed_at
+  from public.definition_sources order by model, firmware, kind, tier, quality desc;
+
+-- confirm a row (served first in its kind, never quarantined) / reject it (never served; sharing it again → 409)
+update public.definition_sources set tier = 'official', pinned = true where id = '<source-id>';
+update public.definition_sources set tier = 'rejected', pinned = true where id = '<source-id>';
+
+-- clear a pin: back to the automatic tier (a row without contributions is then an orphan and goes with the next cleanup)
+update public.definition_sources set pinned = false, tier = 'candidate' where id = '<source-id>';
+select public.definition_source_refresh('<source-id>');
+
+-- lift a quarantine: pin it (above), or drop the failure reports and reset the high-water counter
+delete from public.definition_source_reports where source_id = '<source-id>' and verdict = 'failed';
+update public.definition_sources set spot_failures = 0 where id = '<source-id>';
+
+-- recent spot-check reports (no user data in the output)
+select source_id, verdict, checked, answered, mismatches, created_at
+  from public.definition_source_reports order by created_at desc limit 50;
+```
+
+> **Deploy gate (staging first, then production — before a client build that shares ships):**
+> 1. Apply the migrations (`supabase db push`).
+> 2. Set `DEFINITION_SOURCES_IP_SALT` to a **new** random value of at least 32 characters (never commit it). Missing,
+>    shorter, or equal to `EDITOR_CACHE_IP_SALT`, sharing and reports answer `503 paused` (reads still work).
+> 3. Deploy `definition-sources`, then redeploy `gc-blobs` and `delete-account` (they call the new SQL functions).
+> 4. The daily `gc-blobs` schedule must exist (see "Diagnostic captures"): it unlinks after 180 days and enforces the
+>    retention above. Check one `?dry=1` run reports a `definitionSources` block without `error`.
+> 5. Pin `DEFINITION_SOURCES_IP_HEADERS` after the staging header check (as for editor caches).
+> 6. Run the staging acceptance (share → list → fetch → withdraw; a truncated device read never displaces a complete
+>    one; limits and `DEFINITION_SOURCES=readonly`), and publish the privacy text for shared definitions, before the
+>    client release that enables sharing.
+
+**Function secrets:** `DEFINITION_SOURCES_IP_SALT` (required for writes, ≥ 32 characters, its own value; rotating it
+resets the per-network counters), `DEFINITION_SOURCES` (`on` default, `readonly` = no shares/reports, `off` = no
+public reads either; withdraw and `/mine` work in every mode; any other value counts as `readonly`),
+`DEFINITION_SOURCES_ALLOW_ANONYMOUS` (`0` = accounts only), `DEFINITION_SOURCES_IP_HEADERS` (client-address headers).
+
+**Tests:** `deno test supabase/functions/definition-sources/` (validation matrix, fact-hash parity with the codec's
+golden vectors, handler flow against in-memory fakes; no stack needed) and, on a local stack,
+`npx --yes supabase@latest test db` (`definition_sources.test.sql`: ranking, tiers, limits, withdraw, retention,
+grants).
 
 ## Gating (so it never ships dark)
 The entire sync layer is behind `AXIS_CLOUD=1`. With it unset, ForgeFX loads no cloud code and Axis
@@ -443,8 +617,10 @@ want email confirmations.
 - [x] Global device-definition profile store (`device_profiles` + `device-profiles` edge fn)
 - [x] Opt-in diagnostic capture upload (`diagnostic_captures` + private bucket + `diagnostic-captures` edge fn, signed-upload flow)
 - [x] Opt-in editor-cache contributions (`editor_cache_*` + private bucket + `editor-caches` edge fn; accounts and anonymous sessions)
+- [x] Shared device definitions v2 (`definition_sources` + private contributions/reports/counters + `definition-sources` edge fn; tiers, per-kind ranking, withdraw, 180-day unlink)
 - [ ] Schedule `gc-blobs` daily (deploy gate for both uploads — see "Diagnostic captures")
 - [ ] Hosted project: `EDITOR_CACHE_IP_SALT` secret (≥ 32 chars), anonymous sign-ins on (after the migrations), client-address header pinned after a staging check, covered firmwares marked, Auth audit-log retention decided
+- [ ] Hosted project: `DEFINITION_SOURCES_IP_SALT` secret (≥ 32 chars, its own value), `definition-sources` deployed and `gc-blobs` / `delete-account` redeployed after the migration, staging acceptance, privacy text for shared definitions
 - [ ] Patreon account link → `subscriptions` (hosted supporter tier)
 
 ## License

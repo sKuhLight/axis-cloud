@@ -47,6 +47,15 @@ supabase/
   (`XQ001`–`XQ006`), `complete_editor_cache_upload()`, `set_editor_cache_coverage()` — service_role only.
 - `…_anonymous_session_hardening.sql` — restrictive policies keeping cloud sync, `preset-blobs` and the
   Remote channel closed to Supabase anonymous sessions (anonymous sign-ins are on for editor caches).
+- `…_definition_sources.sql` — shared device definitions (cloud v2): PUBLIC `definition_sources` (sanitized raw
+  source per (model, firmware, kind, fact hash); column-level grant + RLS hiding rejected/quarantined/orphaned rows;
+  day-only dates for clients), PRIVATE `definition_source_contributions` (user id + keyed network marker, one vote per
+  uploader and kind, unlinked after 180 d), `definition_source_reports` (spot checks, 180 d),
+  `definition_source_network_usage` (per-network counters, no user id, 30 d); service_role-only functions
+  `contribute_…` / `withdraw_…` / `report_…` / `select_definition_sources` / `cleanup_orphan_…` /
+  `unlink_expired_…` (`XQ001`/`XQ002` uploader, `XQ005`/`XQ006` network, `XQ007` rejected facts).
+- `…_definition_sources_orphan_reset.sql` — `contribute_definition_source` deletes an unpinned source without
+  contributions (under the source-key lock) before sharing identical facts, so an orphan is never revived.
 
 **Edge functions** (`supabase/functions/*/index.ts`, Deno + `supabase-js`):
 - `delete-account` — GDPR erase. `verify_jwt = true`; identifies the caller from their
@@ -66,9 +75,26 @@ supabase/
   cache (`validate.ts`, self-contained mirror of the codec's walker + a plausibility floor) before
   accepting. Per-uploader and per-network limits; secrets `EDITOR_CACHE_IP_SALT` (required, ≥ 32
   chars), `EDITOR_CACHE_UPLOADS=off`, `EDITOR_CACHE_IP_HEADERS` (pin after a staging check).
+- `definition-sources` — shared device definitions (cloud v2). Public `GET ?model&firmware&rawFormat` (best row
+  per kind + `alternatives`) and `GET /source/<id>` (the handler re-applies the public read filter: service role
+  bypasses RLS); contribute / `POST /withdraw` / `GET /mine` / `POST /report` for accounts AND anonymous sessions.
+  `validate.ts` re-runs the codec's sharing rules and keeps a sanitized copy (unknown keys dropped, `contentSha256` /
+  `walk.abortReason` stripped, `capturedAt` day-coarsened, user tables / tolerant parses refused, plausibility
+  floor over distinct positions and record-carrying sections/blocks); `facts.ts` computes the fact hash
+  (byte-identical to the codec's `sourceFactHash`, pinned by the golden vectors in `fixtures/` — copied verbatim from
+  forgefx-midi, never edited here), summary, quality, coverage score.
+  An Auth outage answers `503 auth-unavailable`, never 401.
+  Secrets `DEFINITION_SOURCES_IP_SALT` (required for writes, ≥ 32 chars, ≠ `EDITOR_CACHE_IP_SALT`), `DEFINITION_SOURCES`
+  (`on|readonly|off`), `DEFINITION_SOURCES_ALLOW_ANONYMOUS`, `DEFINITION_SOURCES_IP_HEADERS`.
 - `gc-blobs` also sweeps both private upload stores (`sweepPrivateUploads`), prunes unlinked
-  editor-cache network counters, and deletes anonymous auth users without uploads after
-  `ANONYMOUS_USER_IDLE_DAYS` (default 30) via the Auth admin API.
+  editor-cache network counters, runs the shared-definitions retention (`unlink_expired_definition_contributions`,
+  `cleanup_orphan_definition_sources`; block `definitionSources`), and deletes anonymous auth users that own no
+  upload and no LINKED definition contribution after `ANONYMOUS_USER_IDLE_DAYS` (default 30) via the Auth admin API;
+  ownership is checked with exact row counts (`owners.ts`), because Data API answers are silently capped at max-rows.
+- `delete-account` withdraws the caller's definition contributions through the SQL function FIRST (ordered locks,
+  orphans deleted at once), deletes their reports, then the auth user, then cleans up orphans.
+- `_shared/` — `cors.ts` (Allow-Headers list) and `network.ts` (`clientNetwork`, `networkKey` with a per-store HMAC
+  domain, `DEFAULT_IP_HEADERS`); editor-caches re-exports the network functions from its `validate.ts`.
 
 **Storage buckets:** `preset-blobs` (private, per-user path RLS, per-object size cap),
 `debug-reports` (private, insert-only), `diagnostic-captures` and `editor-caches` (private, no
@@ -78,7 +104,8 @@ storage policy — signed upload URLs from the edge functions only).
 publishable key is safe to expose — RLS protects every row. Quotas are enforced by a
 `SECURITY DEFINER` trigger as a backstop (the client pre-flights); paid users
 (`subscriptions.active` within period) bypass. `device_profiles` is the one public-read,
-service-role-write table (shared derived data, not user data). **Anonymous sign-ins are enabled**
+service-role-write table (shared derived data, not user data), and `definition_sources` the second (public
+column-level read, writes only through the service-role functions). **Anonymous sign-ins are enabled**
 (editor caches): an anonymous session is role `authenticated` with `is_anonymous: true`, so any new
 account-only policy or function must refuse it explicitly (see the hardening migration).
 
@@ -93,8 +120,8 @@ No local CLI, Deno, or Docker is assumed — invoke the CLI through `npx`:
 - `npx --yes supabase@latest status` — inspect the running local stack.
 
 **There is no automated test gate (no CI) in this repo yet.** What exists: Deno unit tests
-that need no stack — `deno test supabase/functions/editor-caches/ supabase/functions/diagnostic-captures/ supabase/functions/_shared/`
-(Deno is not assumed installed; any Deno 2 works) — and pgTAP suites under
+that need no stack — `deno test supabase/functions/` (editor-caches, diagnostic-captures, definition-sources,
+_shared; Deno is not assumed installed: `npx --yes deno@2 test supabase/functions/` works) — and pgTAP suites under
 `supabase/tests/database/` that need the Docker-gated local stack (`… test db`). Do not claim a
 passing gate that does not exist. (Follow-up tracked in Plane.)
 

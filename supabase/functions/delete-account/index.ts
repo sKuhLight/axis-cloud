@@ -73,15 +73,38 @@ Deno.serve(async (req: Request) => {
     console.error("delete-account: removing editor-cache uploads failed:", e instanceof Error ? e.message : e);
   }
 
-  // 2. Delete the user's rows (explicit; safe regardless of FK cascade). Deleting editor_cache_uploads clears the
-  //    link of its per-network rate-limit counters (they carry no user id and age out after 30 days).
-  for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures", "editor_cache_uploads"]) {
-    await admin.from(table).delete().eq("user_id", uid);
+  // 1d. Shared device definitions: withdraw the user's contributions FIRST, through the SQL function — it takes the
+  //     per-source locks in a fixed order and deletes the sources this leaves without contributions (unless the
+  //     maintainer pinned them) in the same transaction. Deleting the auth user would cascade the rows too, but in
+  //     delete order (deadlock-prone against a concurrent share) and leaving orphans for the cleanup. Then the
+  //     user's spot-check reports. Best-effort and logged: the auth-user cascade below still removes both.
+  try {
+    const { error } = await admin.rpc("withdraw_definition_contributions", { p_user_id: uid });
+    if (error) console.error("delete-account: withdrawing shared definitions failed:", error.message);
+  } catch (e) {
+    console.error("delete-account: withdrawing shared definitions failed:", e instanceof Error ? e.message : e);
   }
 
-  // 3. Delete the auth user itself (erases the email).
+  // 2. Delete the user's rows (explicit; safe regardless of FK cascade). Deleting editor_cache_uploads clears the
+  //    link of its per-network rate-limit counters (they carry no user id and age out after 30 days); the
+  //    definition-source network counters carry no user id either and age out the same way.
+  for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures", "editor_cache_uploads", "definition_source_reports"]) {
+    const { error } = await admin.from(table).delete().eq("user_id", uid);
+    if (error) console.error(`delete-account: deleting ${table} rows failed:`, error.message);
+  }
+
+  // 3. Delete the auth user itself (erases the email; cascades whatever a failed step above left behind).
   const { error: derr } = await admin.auth.admin.deleteUser(uid);
   if (derr) return new Response(JSON.stringify({ error: derr.message }), { status: 500, headers: { ...cors, "Content-Type": "application/json" } });
+
+  // 4. Shared sources left without contributions (only when step 1d failed and the cascade removed the votes):
+  //    the public policy hides them at once; delete them now rather than at the next gc-blobs run. Best-effort.
+  try {
+    const { error } = await admin.rpc("cleanup_orphan_definition_sources");
+    if (error) console.error("delete-account: orphan cleanup of shared definitions failed:", error.message);
+  } catch (e) {
+    console.error("delete-account: orphan cleanup of shared definitions failed:", e instanceof Error ? e.message : e);
+  }
 
   return new Response(JSON.stringify({ ok: true, deleted: uid }), { headers: { ...cors, "Content-Type": "application/json" } });
 });

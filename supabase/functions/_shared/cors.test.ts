@@ -4,6 +4,7 @@
 // Deno.serve on import, so they cannot be imported here; they build their headers with corsHeaders(), which
 // is what these tests pin.
 import { assert, assertEquals } from "jsr:@std/assert@1";
+import { type Deps as DefinitionSourceDeps, handleRequest as handleDefinitionSourceRequest } from "../definition-sources/handler.ts";
 import { type Deps, handleRequest } from "../diagnostic-captures/handler.ts";
 import { type Deps as EditorCacheDeps, handleRequest as handleEditorCacheRequest } from "../editor-caches/handler.ts";
 import { CORS_ALLOW_HEADERS, corsHeaders } from "./cors.ts";
@@ -35,5 +36,11 @@ Deno.test("matches the Allow-Headers of diagnostic-captures, so the functions ca
 Deno.test("matches the Allow-Headers of editor-caches, so the functions cannot drift apart", async () => {
   // OPTIONS is answered before the handler touches its dependencies.
   const res = await handleEditorCacheRequest(new Request("http://localhost/x", { method: "OPTIONS" }), {} as EditorCacheDeps);
+  assertEquals(allowed(res.headers.get("access-control-allow-headers")!), allowed(CORS_ALLOW_HEADERS));
+});
+
+Deno.test("matches the Allow-Headers of definition-sources, so the functions cannot drift apart", async () => {
+  // OPTIONS is answered before the handler touches its dependencies.
+  const res = await handleDefinitionSourceRequest(new Request("http://localhost/x", { method: "OPTIONS" }), {} as DefinitionSourceDeps);
   assertEquals(allowed(res.headers.get("access-control-allow-headers")!), allowed(CORS_ALLOW_HEADERS));
 });

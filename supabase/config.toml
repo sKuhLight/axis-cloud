@@ -76,3 +76,13 @@ verify_jwt = false
 # anonymous sessions are accepted by design. Writes use the service role. Function secrets (never here):
 # EDITOR_CACHE_IP_SALT (required), EDITOR_CACHE_UPLOADS=off (kill switch) — see README "Editor-cache uploads".
 verify_jwt = false
+
+[functions.definition-sources]
+# Shared device definitions (cloud v2): public listing + source bodies; contribute / withdraw / mine / report for
+# accounts AND anonymous sessions. JWT verification is OFF at the platform layer: the reads are public, and the
+# handler authenticates every other request itself (Auth server getUser) before it reads anything. Everything runs
+# with the service role (the handler applies the public read filter itself). Function secrets (never here):
+# DEFINITION_SOURCES_IP_SALT (required for writes, its own value — not the editor-cache salt), DEFINITION_SOURCES
+# (on|readonly|off), DEFINITION_SOURCES_ALLOW_ANONYMOUS, DEFINITION_SOURCES_IP_HEADERS — see README "Shared device
+# definitions".
+verify_jwt = false

@@ -6,8 +6,9 @@
 -- with 2 users x 2 networks, a cleaner live confirmation raising the quality, one vote per uploader and kind,
 -- rejected facts refused, the limits XQ001/XQ002/XQ005/XQ006 with retry seconds, the withdraw/re-share residual),
 -- withdraw and direct deletes (counters recomputed, orphans deleted, pinned kept), reports (high-water counters,
--- contributors' own reports not counted, quarantine rule, verified never quarantined), the 180-day unlink and the
--- account deletion cascade + orphan cleanup.
+-- contributors' own reports not counted, quarantine rule, verified never quarantined), the 180-day unlink, the
+-- account deletion cascade + orphan cleanup, and (20261201121000_definition_sources_orphan_reset.sql) the reset of
+-- an orphan an identical share meets.
 --
 -- All data is synthetic (no device data). Run against a LOCAL stack only (it needs the migrations applied and
 -- creates throw-away users inside a transaction that is rolled back):
@@ -20,7 +21,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 
-select plan(205);
+select plan(212);
 
 -- ── helpers (session-local) ──
 create function pg_temp.u(i integer) returns uuid language sql immutable
@@ -625,6 +626,34 @@ select throws_ok(
       pg_temp.src('live-probe', '13.0'), '{}'::jsonb, 3, 1, 10, '{}'::jsonb, now(), 1)$$,
   '22023', null, 'live-probe sources cannot be contributed');
 select throws_ok($$select * from public.withdraw_definition_contributions(null)$$, '22023', null, 'withdraw needs an uploader');
+
+-- ═════════════════════════════ M. an orphan is reset, not revived (7) ═════════════════════════════
+-- (20261201121000_definition_sources_orphan_reset.sql: an identical share of an unpinned source without contributions
+-- starts a fresh row; a pinned one is confirmed as before)
+
+select pg_temp.put('editor-cache', '25.0', 2501, p_contributors => 0, p_networks => 0, p_failures => 5,
+  p_first_seen => now() - interval '100 days', p_summary => '{"old": true}'::jsonb,
+  p_source => jsonb_build_object('kind', 'editor-cache', 'firmware', '25.0', 'codecVersion', '0.0.0-old', 'records', '[]'::jsonb));
+create temp table orphan_before as select pg_temp.sid(2501, 'editor-cache', '25.0') as id;
+select is((select concat_ws('/', created, deduped, confirmed, tier, contributors, networks) from pg_temp.share(62, 62, 2501, p_fw => '25.0')),
+  't/f/f/candidate/1/1', 'an identical share of an orphan creates a fresh row (not a confirmation)');
+select isnt(pg_temp.sid(2501, 'editor-cache', '25.0'), (select id from orphan_before), 'with a new id (the orphan is gone)');
+select is((select concat_ws('/', first_seen = now(), summary = '{}'::jsonb, source ->> 'codecVersion', spot_failures, quarantined)
+             from public.definition_sources where id = pg_temp.sid(2501, 'editor-cache', '25.0')),
+  't/t/0.0.0-test/0/f', 'the new uploader''s body, summary and date; no inherited reports or quarantine');
+
+select pg_temp.put('editor-cache', '25.0', 2502, p_contributors => 0, p_networks => 0, p_tier => 'official', p_pinned => true);
+create temp table pinned_before as select pg_temp.sid(2502, 'editor-cache', '25.0') as id;
+select is((select concat_ws('/', created, deduped, confirmed, tier, contributors) from pg_temp.share(63, 63, 2502, p_fw => '25.0')),
+  'f/t/t/official/1', 'a pinned source without contributions is confirmed, never reset');
+select is(pg_temp.sid(2502, 'editor-cache', '25.0'), (select id from pinned_before), 'and keeps its id');
+
+select pg_temp.put('editor-cache', '25.0', 2503, p_contributors => 0, p_networks => 0);
+create temp table limited_before as select pg_temp.sid(2503, 'editor-cache', '25.0') as id;
+select throws_ok($$select * from pg_temp.share(64, 64, 2503, p_fw => '25.0', p_max => 0)$$, 'XQ001', null,
+  'a share refused by a limit fails as a whole');
+select is(pg_temp.sid(2503, 'editor-cache', '25.0'), (select id from limited_before),
+  'and leaves the orphan as it was (the reset is rolled back with it)');
 
 select * from finish();
 rollback;
