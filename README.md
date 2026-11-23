@@ -24,6 +24,7 @@ supabase/
     20261123130000_anonymous_session_hardening.sql  # keeps account-only features closed to anonymous sessions
     20261201120000_definition_sources.sql  # shared device definitions: public sources, private contributions/reports/counters, ranking
     20261201121000_definition_sources_orphan_reset.sql  # an identical share of an orphaned source starts a fresh row
+    20261201130000_device_profiles_ranking.sql  # v1 profile store: server-computed row_count + ranking index (no more "newest wins")
   functions/                  # Deno edge functions: delete-account, gc-blobs, device-profiles, diagnostic-captures, editor-caches, definition-sources
     _shared/                  # code shared by the functions (CORS headers, client network + keyed network marker); not deployed itself
 .env.example                  # SUPABASE_URL / SUPABASE_ANON_KEY / AXIS_CLOUD (copy to .env)
@@ -61,12 +62,18 @@ files and never any preset content.**
   only). Keyed by `(model, firmware, content_hash)` with a size guard; `content_hash` is the sha256 of the
   canonical profile JSON, computed **server-side** (a client-supplied hash is never trusted).
 - **Edge function `device-profiles`** (JWT verification off at the platform layer so GET is public):
-  - `GET ?model=<int>&firmware=<string>[&schema=<int>]` → newest matching profile + metadata (`404` if
-    none; `Cache-Control: public, max-age=300`). `schema` is the profile schema the caller can use
-    (`profile.meta.schema`): the newest row **of that schema** is returned, so clients on different
+  - `GET ?model=<int>&firmware=<string>[&schema=<int>]` → the **best** matching profile + metadata (`404` if
+    none; `Cache-Control: public, max-age=300`; response shape unchanged). "Best" is **not** "newest": an
+    `editor-cache` profile comes before a `live-walk` one, then the profile with more `(family, parameter id)`
+    entries in `ranges` (`row_count`), then the **oldest** — so a truncated live walk uploaded later never
+    displaces a complete profile. `row_count` is a stored generated column: the database computes it from the
+    stored document (existing rows were backfilled by the migration), no client can set it, and the uploader's
+    `meta.recordCount` is never used for ranking. `schema` is the profile schema the caller can use
+    (`profile.meta.schema`): the best row **of that schema** is returned, so clients on different
     schemas never hide each other's profiles (`400` unless an integer 1..1000000). Without `schema`
-    (older clients) only unstamped rows and schema <= 1 are served. No migration — the filter reads the
-    stored profile JSON.
+    (older clients) only unstamped rows and schema <= 1 are served. The schema filter reads the
+    stored profile JSON. **Deploy the migration before the function** (GET orders by `row_count`; see the deploy
+    gate below).
   - `POST { model, firmware, source, profile }` → **requires a valid user JWT**. Validates `model`
     (int 1..255), `firmware` (`^\d+\.\d+`), `source` (`live-walk` | `editor-cache`) and the profile's
     plausible `BuiltCache` shape, caps the body (~6 MB), computes the hash, and inserts with the service
@@ -77,6 +84,104 @@ files and never any preset content.**
   string (`"12.0"`).
 - **v2:** clients that know the shared device definitions store (see "Shared device definitions (cloud v2)") read
   that first and fall back to this one; released clients keep using this store unchanged.
+
+**v1 has no trust model.** Any signed-in account can upload (anonymous sessions are refused), the upload is checked
+for its shape only, and the ranking believes what the document says: its `editor-cache` label (with `meta.source:
+"bytes"`) and the number of its `ranges` entries. An uploader can therefore pad `ranges` with invented families or
+ids and **win the ranking** for that (model, firmware, schema) — every released client then downloads that row. The
+only brakes are the account requirement and 10 new profiles per account and hour. A size cap in the POST validation
+would not change that (any cap above real profile sizes still lets a padded profile outrank a real one), so none was
+added; contributors, networks, spot checks and maintainer pins are what the v2 store has. Until released clients use
+it, a bad row is removed by hand.
+
+The same ranking also holds back **good** uploads: a same-schema derivation fix (say corrected `displayMax` values or
+enum labels, re-derived from the same editor cache — same `row_count`, new content hash) no longer reaches v1
+clients. The older row wins the tie, and a fix that *removes* wrong entries even loses on `row_count`. Such a fix
+reaches them only through a schema bump (a new `meta.schema`, served to the clients that ask for it) or by evicting
+the older rows (below). Before this ranking the newest upload won.
+
+**Maintainer (SQL editor; the dashboard runs it as the table owner):**
+
+```sql
+-- the candidates of one (model, firmware), best first: the order GET uses. A client asking for `schema=N` sees only
+-- rows stamped N; a client sending no schema sees the unstamped rows and schemas 0/1 together.
+select id, source, profile -> 'meta' ->> 'schema' as schema, row_count, record_count, created_by, created_at
+  from public.device_profiles where model = 17 and firmware = '12.0'
+ order by source asc, row_count desc nulls last, created_at asc;
+
+-- evict a bad row: from then on (once the 5-minute GET cache has expired) the next candidate is served; copies clients
+-- already downloaded are not reached. Nothing stops the same document from being uploaded again (dedup is per content
+-- hash, there is no block list), so look at `created_by`: remove every row of an abusive account, then deal with the
+-- account itself (Dashboard → Authentication).
+delete from public.device_profiles where id = '<profile-id>';
+delete from public.device_profiles where created_by = '<user-id>';
+```
+
+> **Deploy gate for the ranking (`20261201130000_device_profiles_ranking.sql` + `device-profiles`), staging first,
+> then production:**
+> 1. Before anything is deployed, run the read-only **winner diff** below against the project. It needs no migration
+>    (it computes `row_count` inline, exactly like `device_profile_row_count`) and lists, per (model, firmware,
+>    request shape), the row served today (the newest) next to the row the new ranking will serve; `changes = true`
+>    marks every place where released clients will receive a different profile. Review those rows (evict bad ones by
+>    the id the diff lists, with the `delete` above — the candidates query needs `row_count`, i.e. the migration)
+>    before going on.
+> 2. Apply the migration with `supabase db push`. That applies **every** pending migration: on a project still at
+>    `20261123130000` it also applies the two shared-definitions migrations (`20261201120000_definition_sources.sql`,
+>    `20261201121000_definition_sources_orphan_reset.sql`; see "Shared device definitions (cloud v2)" for their own
+>    gate). The ranking migration's `alter table` holds an ACCESS EXCLUSIVE lock on `device_profiles` while it rewrites
+>    the table (the backfill) and gives up after 5 s waiting for that lock (`lock_timeout`) — simply run it again. It
+>    fails on purpose if a `row_count` column or a `device_profiles_ranking_idx` index already exists (no
+>    `if not exists`: a hand-made, client-settable column must not survive silently).
+> 3. Deploy `device-profiles`.
+
+```sql
+-- PRE-DEPLOY WINNER DIFF (read-only). `asked` = `schema=N` for clients that send a schema (rows stamped N only; N is
+-- 1..1000000, as GET accepts it — schema=0 is a 400, stamps like '01' or '1.0' are never asked for), `no schema` for
+-- older clients (unstamped rows and schemas 0/1). today_* = served now (newest first), new_* = served after the
+-- deploy (editor-cache first, then more ranges, then oldest).
+with cand as (
+  select p.id, p.model, p.firmware, p.source, p.created_at, p.profile -> 'meta' ->> 'schema' as schema,
+         (select coalesce(sum((select count(*) from jsonb_each(case when jsonb_typeof(f.value) = 'object'
+                                                                    then f.value else '{}'::jsonb end))), 0)::integer
+            from jsonb_each(case when jsonb_typeof(p.profile -> 'ranges') = 'object'
+                                 then p.profile -> 'ranges' else '{}'::jsonb end) as f) as row_count
+    from public.device_profiles p
+),
+asked as (
+  select 'schema=' || c.schema as asked, c.* from cand c where c.schema ~ '^([1-9][0-9]{0,5}|1000000)$'
+  union all
+  select 'no schema', c.* from cand c where c.schema is null or c.schema in ('0', '1')
+),
+ranked as (
+  select a.*,
+         row_number() over (partition by a.model, a.firmware, a.asked order by a.created_at desc) as today_rank,
+         row_number() over (partition by a.model, a.firmware, a.asked
+                            order by a.source asc, a.row_count desc nulls last, a.created_at asc) as new_rank
+    from asked a
+)
+select t.model, t.firmware, t.asked, t.id <> n.id as changes,
+       t.id as today_id, t.source as today_source, t.schema as today_schema, t.row_count as today_rows, t.created_at as today_created,
+       n.id as new_id,   n.source as new_source,   n.schema as new_schema,   n.row_count as new_rows,   n.created_at as new_created
+  from ranked t
+  join ranked n on n.model = t.model and n.firmware = t.firmware and n.asked = t.asked and n.new_rank = 1
+ where t.today_rank = 1
+ order by changes desc, t.model, t.firmware, t.asked;
+```
+
+**Open decision (maintainer):** within one request shape the ranking does not look at the schema. For older clients
+(`no schema`) an unstamped profile with more ranges therefore outranks a newer schema-1 profile of the same source,
+which may carry derivation fixes the unstamped one lacks — today the newest (usually the schema-1 one) wins. The
+winner diff shows such places as `changes = true` with `today_schema = 1` and an empty `new_schema`. Either evict
+the unstamped row before the deploy, or add an order term after `source` — `(profile->'meta'->>'schema') desc nulls
+last` (DESC alone would put unstamped rows first) — to `PROFILE_ORDER` in `device-profiles/handler.ts`. Undecided;
+the order above is unchanged. Either way, a same-schema derivation fix no longer wins by being newest (see "v1 has no
+trust model" above): the older row wins the tie, and a fix that removes wrong entries loses on `row_count`. It reaches
+v1 clients only through a schema bump or by evicting the older rows.
+
+**Tests:** `deno test supabase/functions/device-profiles/` (request handling and the order the function asks for,
+against in-memory fakes; `query.test.ts`: the PostgREST request the real supabase-js builder sends, `order=` included)
+and, on a local stack, `npx --yes supabase@latest test db` (`device_profiles_ranking.test.sql`:
+the generated column, its backfill, the order, nobody can set it; `explicit_grants.test.sql`: who may run its helper).
 
 ## Diagnostic captures (opt-in, maintainer-only)
 A signed-in user can upload the result of Axis's in-product **device diagnostic** (Settings → Debugging) so
@@ -621,6 +726,7 @@ want email confirmations.
 - [ ] Schedule `gc-blobs` daily (deploy gate for both uploads — see "Diagnostic captures")
 - [ ] Hosted project: `EDITOR_CACHE_IP_SALT` secret (≥ 32 chars), anonymous sign-ins on (after the migrations), client-address header pinned after a staging check, covered firmwares marked, Auth audit-log retention decided
 - [ ] Hosted project: `DEFINITION_SOURCES_IP_SALT` secret (≥ 32 chars, its own value), `definition-sources` deployed and `gc-blobs` / `delete-account` redeployed after the migration, staging acceptance, privacy text for shared definitions
+- [ ] Hosted project: v1 profile ranking deploy gate — winner diff reviewed, `20261201130000_device_profiles_ranking.sql` applied, `device-profiles` redeployed (staging first; see "Device-definition profile store")
 - [ ] Patreon account link → `subscriptions` (hosted supporter tier)
 
 ## License

@@ -7,9 +7,13 @@
 -- definition_source_* revokes (20261123120000_editor_cache_uploads.sql and 20261201120000_definition_sources.sql
 -- grant their private tables to service_role only), the hardened quota functions, nothing for PUBLIC,
 -- device_profiles.created_by (the migration revokes the table-level SELECT from anon/authenticated and grants
--- only the other columns, so uploader ids are unreadable on old and new stacks alike), definition_sources
--- (column-level SELECT only, revoked at table level by its migration), and RLS-gated writes that fail with
--- 42501 whether the privilege is missing (new default) or RLS rejects the row (older, broader implicit grants).
+-- only the other columns, so uploader ids are unreadable on old and new stacks alike), the row_count helper
+-- device_profile_row_count (EXECUTE revoked from PUBLIC/anon/authenticated by 20261201130000_device_profiles_ranking.sql),
+-- definition_sources (column-level SELECT only, revoked at table level by its migration), and RLS-gated writes that
+-- fail with 42501 whether the privilege is missing (new default) or RLS rejects the row (older, broader implicit
+-- grants). NOT asserted: column INSERT/UPDATE privileges on device_profiles.row_count — older projects keep their
+-- table-level grants, so such a check would not hold on every stack; nor does it need to: the column is GENERATED, so
+-- Postgres rejects any value written to it regardless of grants (device_profiles_ranking.test.sql shows that).
 --
 -- Run against a LOCAL stack only (it needs the migrations applied and creates throw-away rows inside a
 -- transaction that is rolled back):
@@ -19,7 +23,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 
-select plan(141);
+select plan(144);
 
 insert into auth.users (id, email) values
   ('11111111-1111-4111-8111-111111111111', 'grants-a@example.test');
@@ -139,12 +143,12 @@ select is(
 -- grant, so the created_by checks fail if SELECT is ever granted on the whole table again.
 select is(
   (select bool_and(has_column_privilege('anon', 'public.device_profiles', c, 'select'))
-     from unnest(array['id', 'model', 'firmware', 'content_hash', 'profile', 'source', 'record_count', 'created_at']) as c),
+     from unnest(array['id', 'model', 'firmware', 'content_hash', 'profile', 'source', 'record_count', 'created_at', 'row_count']) as c),
   true, 'anon can select every public device_profiles column');
 select is(has_column_privilege('anon', 'public.device_profiles', 'created_by', 'select'), false, 'anon cannot select device_profiles.created_by');
 select is(
   (select bool_and(has_column_privilege('authenticated', 'public.device_profiles', c, 'select'))
-     from unnest(array['id', 'model', 'firmware', 'content_hash', 'profile', 'source', 'record_count', 'created_at']) as c),
+     from unnest(array['id', 'model', 'firmware', 'content_hash', 'profile', 'source', 'record_count', 'created_at', 'row_count']) as c),
   true, 'authenticated can select every public device_profiles column');
 select is(has_column_privilege('authenticated', 'public.device_profiles', 'created_by', 'select'), false, 'authenticated cannot select device_profiles.created_by');
 
@@ -189,6 +193,17 @@ select is(
      cross join unnest(array['public', 'anon', 'authenticated']) as r
     where has_function_privilege(r::name, f, 'execute')),
   null::text[], 'PUBLIC, anon and authenticated cannot execute any definition-source function');
+
+-- ── device_profiles.row_count (ranking key of the v1 profile store): who may run its helper (2) ──
+-- The helper that computes the stored generated column is executed with the INSERTING role's privileges, so
+-- service_role (the edge function) must hold EXECUTE while no client role may. Write privileges on the column itself
+-- are deliberately not asserted (see the header: the column is GENERATED, writes are rejected regardless of grants).
+-- device_profiles_ranking.test.sql covers what the column holds and that nobody can set it.
+select is(has_function_privilege('service_role', 'public.device_profile_row_count(jsonb)', 'execute'), true, 'service_role can execute device_profile_row_count');
+select is(
+  (select array_agg(r order by r) from unnest(array['public', 'anon', 'authenticated']) as r
+    where has_function_privilege(r::name, 'public.device_profile_row_count(jsonb)', 'execute')),
+  null::text[], 'PUBLIC, anon and authenticated cannot execute device_profile_row_count');
 
 -- ── nothing for PUBLIC (4) ──
 select is(has_table_privilege('public', 'public.documents', 'select'), false, 'PUBLIC has no SELECT on documents');
@@ -238,7 +253,7 @@ select lives_ok('select * from public.subscriptions', 'authenticated can read su
 select is((select count(*)::integer from public.tier_limits where tier = 'free'), 1, 'authenticated can read tier_limits');
 select is(
   (select count(*)::integer from (
-     select id, model, firmware, content_hash, profile, source, record_count, created_at
+     select id, model, firmware, content_hash, profile, source, record_count, created_at, row_count
        from public.device_profiles where content_hash = 'grants-test-1') s),
   1, 'authenticated can read the public device_profiles columns');
 select throws_ok('select created_by from public.device_profiles', '42501', null, 'authenticated cannot read device_profiles.created_by');
@@ -268,7 +283,7 @@ set local request.jwt.claims = '{"role":"anon"}';
 set local request.jwt.claim.sub = '';
 select is(
   (select count(*)::integer from (
-     select id, model, firmware, content_hash, profile, source, record_count, created_at
+     select id, model, firmware, content_hash, profile, source, record_count, created_at, row_count
        from public.device_profiles where content_hash = 'grants-test-1') s),
   1, 'anon can read the public device_profiles columns');
 select throws_ok('select created_by from public.device_profiles', '42501', null, 'anon cannot read device_profiles.created_by');
@@ -285,7 +300,7 @@ select is(
 select throws_ok('select network_key from public.definition_source_reports', '42501', null, 'anon cannot read definition_source_reports');
 reset role;
 
--- ── service_role: the edge-function and maintainer flows work (25) ──
+-- ── service_role: the edge-function and maintainer flows work (26) ──
 set local role service_role;
 
 -- subscriptions: written by the service role (Patreon link / maintainer), read by is_paid
@@ -303,6 +318,8 @@ select lives_ok(
     values (17, '12.0', 'grants-test-2', '{}'::jsonb, 'live-walk')$$,
   'service_role can insert device_profiles');
 select is((select count(*)::integer from public.device_profiles where content_hash like 'grants-test-%'), 2, 'service_role can read device_profiles');
+-- the insert above evaluated the generated row_count as service_role (EXECUTE on the helper); a profile without ranges scores 0
+select is((select row_count from public.device_profiles where content_hash = 'grants-test-2'), 0, 'service_role inserts get a server-computed row_count');
 
 -- diagnostic-captures function: reserve (rpc), finalize (update), maintainer read, delete
 select lives_ok(
