@@ -84,8 +84,8 @@ supabase/
   accepting. Per-uploader and per-network limits; secrets `EDITOR_CACHE_IP_SALT` (required, ≥ 32
   chars), `EDITOR_CACHE_UPLOADS=off`, `EDITOR_CACHE_IP_HEADERS` (pin after a staging check).
 - `definition-sources` — shared device definitions (cloud v2). Public `GET ?model&firmware&rawFormat` (best row
-  per kind + `alternatives`) and `GET /source/<id>` (the handler re-applies the public read filter: service role
-  bypasses RLS); contribute / `POST /withdraw` / `GET /mine` / `POST /report` for accounts AND anonymous sessions.
+  per kind + `alternatives` + `allowAnonymous`, the switch contribute/report enforce, so clients skip minting an
+  anonymous session) and `GET /source/<id>` (the handler re-applies the public read filter: service role bypasses RLS); contribute / `POST /withdraw` / `GET /mine` / `POST /report` for accounts AND anonymous sessions.
   `validate.ts` re-runs the codec's sharing rules and keeps a sanitized copy (unknown keys dropped, `contentSha256` /
   `walk.abortReason` stripped, `capturedAt` day-coarsened, user tables / tolerant parses refused, plausibility
   floor over distinct positions and record-carrying sections/blocks); `facts.ts` computes the fact hash

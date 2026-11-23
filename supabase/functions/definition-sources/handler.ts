@@ -7,9 +7,11 @@
 // (migrations/20261201120000_definition_sources.sql); this layer validates, sanitizes and computes the facts.
 //
 //  GET   /definition-sources?model=17&firmware=13.0[&rawFormat=1]          public, no auth
-//     200 { model, firmware, sources: SourceSummary[], alternatives: { 'editor-cache', 'live-full', 'live-readonly' } }
+//     200 { model, firmware, sources: SourceSummary[], alternatives: { 'editor-cache', 'live-full', 'live-readonly' },
+//           allowAnonymous }
 //         best servable row per kind (none: `sources: []`), Cache-Control: public, max-age=300. `alternatives` =
-//         servable rows of that kind INCLUDING the one listed. Dates are UTC days (`YYYY-MM-DD`).
+//         servable rows of that kind INCLUDING the one listed. Dates are UTC days (`YYYY-MM-DD`). `allowAnonymous` =
+//         whether contribute/report accept anonymous sessions (says nothing about readonly/off).
 //  GET   /definition-sources/source/<id>                                     public, no auth
 //     200 { id, model, firmware, kind, rawFormat, factHash, tier, quality, summary, source }
 //         Cache-Control: public, max-age=86400. 404 not-found for a missing, rejected, quarantined or orphaned row.
@@ -506,7 +508,11 @@ async function list(url: URL, deps: Deps, cfg: HandlerConfig): Promise<Response>
       summary: r.summary
     });
   }
-  return reply(200, { model, firmware, sources, alternatives }, { "Cache-Control": `public, max-age=${LIST_MAX_AGE_SECONDS}` });
+  // `allowAnonymous` is the very switch authorize() enforces on contribute/report: advertised here so a client can
+  // tell, before it mints an anonymous Auth user, that sharing would only be answered with 403 account-required.
+  // Appended last: additive, the existing fields keep their names and order. The listing is cached for
+  // LIST_MAX_AGE_SECONDS, so a flip of the setting reaches clients within that window.
+  return reply(200, { model, firmware, sources, alternatives, allowAnonymous: cfg.allowAnonymous }, { "Cache-Control": `public, max-age=${LIST_MAX_AGE_SECONDS}` });
 }
 
 // ── GET /source/<id> ──

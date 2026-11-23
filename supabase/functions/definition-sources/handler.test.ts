@@ -401,13 +401,43 @@ Deno.test("GET listing: none -> sources [] (no 404); rawFormat defaults to 1; a 
   const f = makeDeps();
   const r = await call(f, req("GET", "?model=17&firmware=14.0"));
   assertEquals(r.status, 200);
-  assertEquals(r.body, { model: 17, firmware: "14.0", sources: [], alternatives: { "editor-cache": 0, "live-readonly": 0, "live-full": 0 } });
+  assertEquals(r.body, { model: 17, firmware: "14.0", sources: [], alternatives: { "editor-cache": 0, "live-readonly": 0, "live-full": 0 }, allowAnonymous: true });
   assertEquals(f.calls.select, [[17, "14.0", 1]]);
   const am4 = await call(f, req("GET", "?model=21&firmware=1.0"));
   assertEquals(am4.status, 200);
   assertEquals(am4.body.sources, []);
   assertEquals(f.calls.select.length, 1);
   assertEquals((await call(f, req("GET", "?model=17&firmware=13.00"))).body.firmware, "13.0");
+});
+
+Deno.test("GET listing: advertises allowAnonymous (the switch POST enforces), additive and last; per-source and /mine bodies carry no such field", async () => {
+  const f = makeDeps();
+  const s = putSource(f, { factHash: "a".repeat(64) });
+  const on = await call(f, req("GET", "?model=17&firmware=13.0&rawFormat=1"), { ...SMALL, allowAnonymous: true });
+  const off = await call(f, req("GET", "?model=17&firmware=13.0&rawFormat=1"), { ...SMALL, allowAnonymous: false });
+  assertEquals([on.status, off.status], [200, 200]);
+  assertEquals(on.body.allowAnonymous, true);
+  assertEquals(off.body.allowAnonymous, false);
+  // a real boolean, appended after the existing fields (which keep their names and order)
+  assertEquals(Object.keys(on.body), ["model", "firmware", "sources", "alternatives", "allowAnonymous"]);
+  assertEquals(Object.keys(off.body), ["model", "firmware", "sources", "alternatives", "allowAnonymous"]);
+  // nothing else of the listing moves with the switch, and the cache policy is unchanged
+  assertEquals({ ...off.body, allowAnonymous: true }, on.body);
+  assertEquals(on.headers.get("cache-control"), "public, max-age=300");
+  assertEquals(off.headers.get("cache-control"), "public, max-age=300");
+  // also when nothing is listed (a model that does not contribute skips the DB but still reports the switch)
+  const none = await call(f, req("GET", "?model=21&firmware=1.0"), { ...SMALL, allowAnonymous: false });
+  assertEquals(none.body.allowAnonymous, false);
+  // the advertised value is the one POST enforces
+  const refused = await call(f, share(editorCacheFixture(), { token: TOKEN_ANON }), { ...SMALL, allowAnonymous: false });
+  assertEquals([refused.status, refused.body.error], [403, "account-required"]);
+  const accepted = await call(f, share(editorCacheFixture(), { token: TOKEN_ANON }), { ...SMALL, allowAnonymous: true });
+  assertEquals(accepted.status, 201);
+  // per-source bodies and /mine are untouched
+  const one = await call(f, req("GET", `/source/${s.id}`), { ...SMALL, allowAnonymous: false });
+  assertEquals("allowAnonymous" in one.body, false);
+  const mine = await call(f, req("GET", "/mine", { token: TOKEN }), { ...SMALL, allowAnonymous: false });
+  assertEquals("allowAnonymous" in mine.body, false);
 });
 
 Deno.test("GET listing: bad query -> 400 invalid-request (not cached)", async () => {
