@@ -5,7 +5,8 @@
 // Request headers a browser may send: supabase-js (and any fetch that mimics it) adds `apikey` and
 // `x-client-info` on top of `authorization` and `content-type`. None of them is CORS-safelisted, so each
 // must be listed here or the preflight fails and the browser never sends the real request.
-// diagnostic-captures/handler.ts carries the same list; cors.test.ts fails if the two drift apart.
+// diagnostic-captures/handler.ts and editor-caches/handler.ts carry the same list (definition-sources/handler.ts
+// imports it from here); cors.test.ts fails if any of them drifts apart.
 export const CORS_ALLOW_HEADERS = "authorization, content-type, apikey, x-client-info";
 
 /** CORS response headers for a function; `methods` is the Access-Control-Allow-Methods value. */

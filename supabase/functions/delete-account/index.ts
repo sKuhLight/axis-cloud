@@ -10,8 +10,8 @@ type Admin = SupabaseClient;
 
 // Removes every object under `<prefix>/` in a bucket, paging until it is empty. Best-effort like the rest of
 // this function: a failure is LOGGED and stops the loop (the account deletion still proceeds). For the
-// diagnostic-captures bucket the gc-blobs sweep then removes the leftovers: once their rows are gone they are
-// unreferenced, and it deletes unreferenced objects older than 24 h on its next scheduled run.
+// diagnostic-captures and editor-caches buckets the gc-blobs sweep then removes the leftovers: once their rows are
+// gone they are unreferenced, and it deletes unreferenced objects older than 24 h on its next scheduled run.
 async function removeAllUnder(admin: Admin, bucket: string, prefix: string): Promise<void> {
   for (let round = 0; round < 100; round++) {
     const { data: files, error } = await admin.storage.from(bucket).list(prefix, { limit: 1000 });
@@ -65,14 +65,46 @@ Deno.serve(async (req: Request) => {
     console.error("delete-account: removing diagnostic captures failed:", e instanceof Error ? e.message : e);
   }
 
-  // 2. Delete the user's rows (explicit; safe regardless of FK cascade).
-  for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures"]) {
-    await admin.from(table).delete().eq("user_id", uid);
+  // 1c. Remove the user's editor-cache uploads (<uid>/<sha256>.cache). Works the same for an anonymous session —
+  //     that is how an anonymous uploader erases everything at once. Leftovers are swept by gc-blobs as above.
+  try {
+    await removeAllUnder(admin, "editor-caches", uid);
+  } catch (e) {
+    console.error("delete-account: removing editor-cache uploads failed:", e instanceof Error ? e.message : e);
   }
 
-  // 3. Delete the auth user itself (erases the email).
+  // 1d. Shared device definitions: withdraw the user's contributions FIRST, through the SQL function — it takes the
+  //     per-source locks in a fixed order and deletes the sources this leaves without contributions (unless the
+  //     maintainer pinned them) in the same transaction. Deleting the auth user would cascade the rows too, but in
+  //     delete order (deadlock-prone against a concurrent share) and leaving orphans for the cleanup. Then the
+  //     user's spot-check reports. Best-effort and logged: the auth-user cascade below still removes both.
+  try {
+    const { error } = await admin.rpc("withdraw_definition_contributions", { p_user_id: uid });
+    if (error) console.error("delete-account: withdrawing shared definitions failed:", error.message);
+  } catch (e) {
+    console.error("delete-account: withdrawing shared definitions failed:", e instanceof Error ? e.message : e);
+  }
+
+  // 2. Delete the user's rows (explicit; safe regardless of FK cascade). Deleting editor_cache_uploads clears the
+  //    link of its per-network rate-limit counters (they carry no user id and age out after 30 days); the
+  //    definition-source network counters carry no user id either and age out the same way.
+  for (const table of ["documents", "preset_versions", "backups", "subscriptions", "diagnostic_captures", "editor_cache_uploads", "definition_source_reports"]) {
+    const { error } = await admin.from(table).delete().eq("user_id", uid);
+    if (error) console.error(`delete-account: deleting ${table} rows failed:`, error.message);
+  }
+
+  // 3. Delete the auth user itself (erases the email; cascades whatever a failed step above left behind).
   const { error: derr } = await admin.auth.admin.deleteUser(uid);
   if (derr) return new Response(JSON.stringify({ error: derr.message }), { status: 500, headers: { ...cors, "Content-Type": "application/json" } });
+
+  // 4. Shared sources left without contributions (only when step 1d failed and the cascade removed the votes):
+  //    the public policy hides them at once; delete them now rather than at the next gc-blobs run. Best-effort.
+  try {
+    const { error } = await admin.rpc("cleanup_orphan_definition_sources");
+    if (error) console.error("delete-account: orphan cleanup of shared definitions failed:", error.message);
+  } catch (e) {
+    console.error("delete-account: orphan cleanup of shared definitions failed:", e instanceof Error ? e.message : e);
+  }
 
   return new Response(JSON.stringify({ ok: true, deleted: uid }), { headers: { ...cors, "Content-Type": "application/json" } });
 });

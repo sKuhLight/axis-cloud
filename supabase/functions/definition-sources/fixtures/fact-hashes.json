@@ -1,0 +1,495 @@
+{
+  "format": 1,
+  "factHashVersion": 1,
+  "description": "Golden vectors for canonicalJson and sourceFactHash (synthetic, built from committed catalog rows). A fact hash is sha256 (lower-case hex) of the UTF-8 canonical JSON of the fact document; the sources below are hashed with the given model and firmware. Not part of the fact document, so they must not change the hash: id, origin, capturedAt, codecVersion, fileVersion, contentSha256, issues, the live walk statistics; for live sources also record kind, count, x, t1, t2, unit, taper and the scope maxParamId, bounds and idLists. The vectors are copied verbatim into the backend repository: changing them requires a FACT_HASH_VERSION bump.",
+  "canonicalJson": [
+    {
+      "name": "empty containers",
+      "input": {
+        "a": {},
+        "b": []
+      },
+      "expected": "{\"a\":{},\"b\":[]}"
+    },
+    {
+      "name": "keys sort by UTF-16 code unit, not numerically",
+      "input": {
+        "9": 5,
+        "10": 4,
+        "b": 1,
+        "a": 2,
+        "B": 3,
+        "é": 6,
+        "aa": 7
+      },
+      "expected": "{\"10\":4,\"9\":5,\"B\":3,\"a\":2,\"aa\":7,\"b\":1,\"é\":6}"
+    },
+    {
+      "name": "literals and nesting",
+      "input": {
+        "z": null,
+        "y": true,
+        "x": false,
+        "w": [
+          {
+            "b": 1,
+            "a": []
+          }
+        ]
+      },
+      "expected": "{\"w\":[{\"a\":[],\"b\":1}],\"x\":false,\"y\":true,\"z\":null}"
+    },
+    {
+      "name": "integers are exact",
+      "input": [
+        0,
+        1,
+        -1,
+        100,
+        20000,
+        1000000,
+        1234567,
+        16777216,
+        1e+21
+      ],
+      "expected": "[0,1,-1,100,20000,1000000,1234567,16777216,1e+21]"
+    },
+    {
+      "name": "other numbers have six significant digits",
+      "input": [
+        0.5,
+        -12.5,
+        0.1,
+        0.10000000149011612,
+        0.30000000000000004,
+        99.99999,
+        1234567.875,
+        0.000123456789,
+        1e-7,
+        -1.234567e-7
+      ],
+      "expected": "[0.5,-12.5,0.1,0.1,0.3,100,1234570,0.000123457,1e-7,-1.23457e-7]"
+    },
+    {
+      "name": "strings use the ECMAScript JSON form",
+      "input": [
+        "a\"b\\c",
+        "x\u0001y\nz\tq",
+        "é€🎸",
+        "\ud800",
+        "</script>"
+      ],
+      "expected": "[\"a\\\"b\\\\c\",\"x\\u0001y\\nz\\tq\",\"é€🎸\",\"\\ud800\",\"</script>\"]"
+    },
+    {
+      "name": "a key needing escapes",
+      "input": {
+        "k\"\\": 1
+      },
+      "expected": "{\"k\\\"\\\\\":1}"
+    }
+  ],
+  "sources": [
+    {
+      "name": "editor-cache",
+      "file": "editor-cache.source.json",
+      "model": 17,
+      "firmware": "12.0",
+      "factHash": "b34e7bc746022ebe2d28b428f6eafd63a639cfc3cfe95c0f4de94e2024e5ced3"
+    },
+    {
+      "name": "live-readonly",
+      "file": "live-readonly.source.json",
+      "model": 17,
+      "firmware": "12.0",
+      "factHash": "3545c4976c7e12121850921357770ab56f5cb5308a9621f8d91adb8ff143a2e1"
+    }
+  ],
+  "tiny": [
+    {
+      "name": "tiny-editor-cache",
+      "model": 17,
+      "firmware": "12.0",
+      "source": {
+        "kind": "editor-cache",
+        "space": "section",
+        "capturedAt": "2026-11-22T00:00:00.000Z",
+        "firmware": "12.0",
+        "codecVersion": "0.0.0-fixture",
+        "sections": [
+          {
+            "tag": 7,
+            "count": 2
+          },
+          {
+            "tag": 4,
+            "count": 1
+          }
+        ],
+        "omitted": {
+          "tables": 1,
+          "records": 1
+        },
+        "header": {
+          "major": 12,
+          "minor": 0,
+          "sectionCount": 2
+        },
+        "fileVersion": "12.0",
+        "contentSha256": null,
+        "records": [
+          {
+            "kind": "float",
+            "section": 7,
+            "id": 1,
+            "tc": 68,
+            "min": 0.10000000149011612,
+            "max": 1,
+            "def": 0.5,
+            "step": 0.001,
+            "t1": 4,
+            "t2": 4
+          },
+          {
+            "kind": "enum",
+            "section": 7,
+            "id": 0,
+            "tc": 16,
+            "min": 0,
+            "max": 1,
+            "def": 0,
+            "step": 0,
+            "count": 2,
+            "values": [
+              "A",
+              "B é"
+            ],
+            "x": 0
+          }
+        ]
+      },
+      "canonical": "{\"firmware\":\"12.0\",\"header\":{\"major\":12,\"minor\":0,\"sectionCount\":2},\"kind\":\"editor-cache\",\"model\":17,\"omitted\":{\"records\":1,\"tables\":1},\"rawFormat\":1,\"records\":[{\"count\":2,\"def\":0,\"id\":0,\"kind\":\"enum\",\"max\":1,\"min\":0,\"section\":7,\"step\":0,\"tc\":16,\"values\":[\"A\",\"B é\"],\"x\":0},{\"def\":0.5,\"id\":1,\"kind\":\"float\",\"max\":1,\"min\":0.1,\"section\":7,\"step\":0.001,\"t1\":4,\"t2\":4,\"tc\":68}],\"sections\":[{\"count\":1,\"tag\":4},{\"count\":2,\"tag\":7}],\"v\":1}",
+      "factHash": "64d29b633e87722e04ce50dbc44c2dbaa792754089a3490c073c161286ab311d"
+    },
+    {
+      "name": "tiny-editor-cache-edge",
+      "model": 17,
+      "firmware": "13.0",
+      "source": {
+        "kind": "editor-cache",
+        "space": "section",
+        "capturedAt": null,
+        "firmware": "13.0",
+        "codecVersion": "0.0.0-fixture",
+        "sections": [
+          {
+            "tag": 7,
+            "count": 2
+          },
+          {
+            "tag": 65535,
+            "count": 1
+          },
+          {
+            "tag": 0,
+            "count": 1
+          },
+          {
+            "tag": 7,
+            "count": 1
+          }
+        ],
+        "omitted": {
+          "tables": 0,
+          "records": 0
+        },
+        "header": null,
+        "fileVersion": null,
+        "contentSha256": null,
+        "records": [
+          {
+            "kind": "float",
+            "section": 7,
+            "id": 2,
+            "tc": 1393,
+            "min": 0.009999999776482582,
+            "max": 100,
+            "def": 1234567.875,
+            "step": 0.001,
+            "t1": 7,
+            "t2": 1
+          },
+          {
+            "kind": "enum",
+            "section": 65535,
+            "id": 65279,
+            "tc": 4294967295,
+            "min": 0,
+            "max": 2,
+            "def": 1,
+            "step": 0,
+            "count": 3,
+            "values": [
+              "x",
+              "y",
+              "z"
+            ],
+            "x": 4294967295,
+            "wireIds": [
+              4294967295,
+              0,
+              65536
+            ]
+          },
+          {
+            "kind": "float",
+            "section": 0,
+            "id": 0,
+            "tc": 0,
+            "min": 0,
+            "max": 0,
+            "def": 0,
+            "step": 0,
+            "t1": 0,
+            "t2": 0
+          },
+          {
+            "kind": "float",
+            "section": 7,
+            "id": 2,
+            "tc": 1393,
+            "min": 0.009999999776482582,
+            "max": 100,
+            "def": 1234567.875,
+            "step": 0.001,
+            "t1": 7,
+            "t2": 1
+          }
+        ]
+      },
+      "canonical": "{\"firmware\":\"13.0\",\"header\":null,\"kind\":\"editor-cache\",\"model\":17,\"omitted\":{\"records\":0,\"tables\":0},\"rawFormat\":1,\"records\":[{\"def\":0,\"id\":0,\"kind\":\"float\",\"max\":0,\"min\":0,\"section\":0,\"step\":0,\"t1\":0,\"t2\":0,\"tc\":0},{\"def\":1234570,\"id\":2,\"kind\":\"float\",\"max\":100,\"min\":0.01,\"section\":7,\"step\":0.001,\"t1\":7,\"t2\":1,\"tc\":1393},{\"count\":3,\"def\":1,\"id\":65279,\"kind\":\"enum\",\"max\":2,\"min\":0,\"section\":65535,\"step\":0,\"tc\":4294967295,\"values\":[\"x\",\"y\",\"z\"],\"wireIds\":[4294967295,0,65536],\"x\":4294967295}],\"sections\":[{\"count\":1,\"tag\":0},{\"count\":1,\"tag\":7},{\"count\":2,\"tag\":7},{\"count\":1,\"tag\":65535}],\"v\":1}",
+      "factHash": "da97358849a1edb1288bb13acdb491a09db80eb7a41919bfa6f8b9a68da720b7"
+    },
+    {
+      "name": "tiny-live-full",
+      "model": 17,
+      "firmware": "13.0",
+      "source": {
+        "kind": "live-full",
+        "space": "block",
+        "capturedAt": "2026-11-22T00:00:00.000Z",
+        "firmware": "13.0",
+        "codecVersion": "0.0.0-fixture",
+        "scope": {
+          "blocks": [
+            78,
+            66
+          ],
+          "maxParamId": 127,
+          "bounds": {
+            "66": 100
+          },
+          "idLists": {
+            "66": [
+              130,
+              128
+            ]
+          },
+          "extended": true,
+          "above160": false,
+          "hinted": true
+        },
+        "walk": {
+          "queries": 900,
+          "lostReplies": 0,
+          "recoveredReplies": 0,
+          "unresolvedReplies": 0,
+          "placeholderSlots": 1,
+          "missingSlots": 0,
+          "silentAddresses": 0,
+          "boundHits": [],
+          "extension": "done"
+        },
+        "records": [
+          {
+            "kind": "float",
+            "section": 66,
+            "id": 3,
+            "tc": 353,
+            "min": -60,
+            "max": 20,
+            "def": -12.5,
+            "step": 0.10000000149011612,
+            "unit": "dB",
+            "t1": 0,
+            "t2": 1,
+            "taper": {
+              "shape": "custom",
+              "err": 0.0123456789,
+              "reliable": true,
+              "points": [
+                [
+                  0,
+                  -60
+                ],
+                [
+                  0.5,
+                  -20.123456789
+                ],
+                [
+                  1,
+                  20
+                ]
+              ]
+            }
+          },
+          {
+            "kind": "float",
+            "section": 66,
+            "id": 1,
+            "tc": 0,
+            "min": 0,
+            "max": 0,
+            "def": 0,
+            "step": 0,
+            "t1": 0,
+            "t2": 0,
+            "placeholder": true
+          }
+        ]
+      },
+      "canonical": "{\"firmware\":\"13.0\",\"kind\":\"live-full\",\"model\":17,\"rawFormat\":1,\"records\":[{\"def\":0,\"id\":1,\"max\":0,\"min\":0,\"placeholder\":true,\"section\":66,\"step\":0,\"tc\":0},{\"def\":-12.5,\"id\":3,\"max\":20,\"min\":-60,\"section\":66,\"step\":0.1,\"tc\":353}],\"scope\":{\"above160\":false,\"blocks\":[66,78],\"extended\":true,\"hinted\":true},\"v\":1}",
+      "factHash": "848fc1e9ff7e33841ba59623b69a8db6899c77ca8833e4edfbe0b309bf5135a7"
+    },
+    {
+      "name": "tiny-live-readonly",
+      "model": 17,
+      "firmware": "12.0",
+      "source": {
+        "kind": "live-readonly",
+        "space": "block",
+        "capturedAt": "2026-11-22T00:00:00.000Z",
+        "firmware": "12.0",
+        "codecVersion": "0.0.0-fixture",
+        "scope": {
+          "blocks": [
+            78,
+            66
+          ],
+          "maxParamId": 127,
+          "bounds": {
+            "66": 100
+          },
+          "idLists": {
+            "66": [
+              130,
+              128
+            ]
+          },
+          "extended": false,
+          "above160": false,
+          "hinted": true
+        },
+        "walk": {
+          "queries": 700,
+          "lostReplies": 1,
+          "recoveredReplies": 1,
+          "unresolvedReplies": 0,
+          "placeholderSlots": 1,
+          "missingSlots": 0,
+          "silentAddresses": 0,
+          "boundHits": [],
+          "extension": "skipped"
+        },
+        "records": [
+          {
+            "kind": "float",
+            "section": 78,
+            "id": 1,
+            "tc": 353,
+            "min": -60,
+            "max": 20,
+            "def": -12.5,
+            "step": 0.10000000149011612,
+            "unit": "dB",
+            "t1": 0,
+            "t2": 1
+          },
+          {
+            "kind": "enum",
+            "section": 66,
+            "id": 2,
+            "tc": 16,
+            "min": 0,
+            "max": 2,
+            "def": 1,
+            "step": 0,
+            "count": 3,
+            "values": [
+              "A",
+              "B",
+              "C"
+            ],
+            "x": 0
+          },
+          {
+            "kind": "enum",
+            "section": 66,
+            "id": 1,
+            "tc": 16,
+            "min": 0,
+            "max": 5,
+            "def": 2,
+            "step": 1,
+            "count": 6,
+            "values": [],
+            "x": 0
+          },
+          {
+            "kind": "float",
+            "section": 66,
+            "id": 3,
+            "tc": 0,
+            "min": 0,
+            "max": 0,
+            "def": 0,
+            "step": 0,
+            "t1": 0,
+            "t2": 0,
+            "placeholder": true
+          },
+          {
+            "kind": "float",
+            "section": 66,
+            "id": 4,
+            "tc": 68,
+            "min": 0.10000000149011612,
+            "max": 10,
+            "def": 5,
+            "step": 0.001,
+            "unit": "s",
+            "t1": 4,
+            "t2": 4,
+            "taper": {
+              "shape": "log",
+              "err": 0.01,
+              "reliable": true,
+              "points": [
+                [
+                  0,
+                  0.1
+                ],
+                [
+                  1,
+                  10
+                ]
+              ]
+            }
+          }
+        ]
+      },
+      "canonical": "{\"firmware\":\"12.0\",\"kind\":\"live-readonly\",\"model\":17,\"rawFormat\":1,\"records\":[{\"def\":2,\"id\":1,\"max\":5,\"min\":0,\"section\":66,\"step\":1,\"tc\":16},{\"def\":1,\"id\":2,\"max\":2,\"min\":0,\"section\":66,\"step\":0,\"tc\":16,\"values\":[\"A\",\"B\",\"C\"]},{\"def\":0,\"id\":3,\"max\":0,\"min\":0,\"placeholder\":true,\"section\":66,\"step\":0,\"tc\":0},{\"def\":5,\"id\":4,\"max\":10,\"min\":0.1,\"section\":66,\"step\":0.001,\"tc\":68},{\"def\":-12.5,\"id\":1,\"max\":20,\"min\":-60,\"section\":78,\"step\":0.1,\"tc\":353}],\"scope\":{\"above160\":false,\"blocks\":[66,78],\"extended\":false,\"hinted\":true},\"v\":1}",
+      "factHash": "fb12c36079e91911871b03de22fda685b490478ba09085127e0595a83de609a3"
+    }
+  ]
+}
